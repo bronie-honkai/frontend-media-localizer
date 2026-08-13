@@ -14,6 +14,7 @@ const API_BASE = '/api/plugins/frontend-media-localizer';
 const EXTENSION_PUBLIC_PATH = '/scripts/extensions/third-party/frontend-media-localizer';
 const BACKEND_PLUGIN_FOLDER = 'frontend-media-localizer';
 const BACKEND_TEMPLATE_FILES = ['index.mjs', 'package.json'];
+const REQUIRED_BACKEND_VERSION = '1.2.0';
 const MEDIA_TYPES = ['image', 'audio', 'video'];
 const TYPE_LABELS = { image: '图片', audio: '音频', video: '视频' };
 const TYPE_ICONS = { image: 'fa-image', audio: 'fa-music', video: 'fa-film' };
@@ -39,6 +40,8 @@ let queueDisplayIndex = 0;
 let allCardsRefreshPromise = null;
 let allCardsPollTimer = null;
 let backendInstallPrompted = false;
+let backendUpdateRequired = false;
+let detectedBackendVersion = null;
 
 function getSettings() {
     if (!extension_settings[EXTENSION_KEY] || typeof extension_settings[EXTENSION_KEY] !== 'object') {
@@ -160,15 +163,32 @@ async function api(pathname, options = {}) {
     return body;
 }
 
+function isVersionAtLeast(actual, required) {
+    if (!actual) return false;
+    const normalize = value => String(value).split('-')[0].split('.').map(part => Number.parseInt(part, 10) || 0);
+    const left = normalize(actual);
+    const right = normalize(required);
+    const length = Math.max(left.length, right.length);
+    for (let index = 0; index < length; index++) {
+        const difference = (left[index] || 0) - (right[index] || 0);
+        if (difference !== 0) return difference > 0;
+    }
+    return true;
+}
+
 async function checkServer() {
     try {
         const status = await api('/status', { method: 'GET', headers: {} });
-        serverAvailable = Boolean(status.enabled && status.writable);
-        updateSettingsStatus(status);
+        detectedBackendVersion = status.version || null;
+        backendUpdateRequired = Boolean(status.enabled && status.writable && !isVersionAtLeast(detectedBackendVersion, REQUIRED_BACKEND_VERSION));
+        serverAvailable = Boolean(status.enabled && status.writable && !backendUpdateRequired);
+        updateSettingsStatus({ ...status, updateRequired: backendUpdateRequired });
         refreshAllCardsInline();
         return status;
     } catch (error) {
         serverAvailable = false;
+        backendUpdateRequired = false;
+        detectedBackendVersion = null;
         updateSettingsStatus({ enabled: false, error: error.message });
         return null;
     }
@@ -177,12 +197,25 @@ async function checkServer() {
 function updateSettingsStatus(status) {
     const indicator = document.querySelector('#fml-server-status');
     if (indicator) {
-        indicator.className = `fml-status ${status?.writable ? 'is-ok' : 'is-error'}`;
-        indicator.textContent = status?.writable ? '服务端已连接，可读写' : '服务端未连接，请重启酒馆';
+        const ready = Boolean(status?.writable && !status?.updateRequired);
+        indicator.className = `fml-status ${ready ? 'is-ok' : 'is-error'}`;
+        indicator.textContent = status?.updateRequired
+            ? `服务端版本 ${detectedBackendVersion || '旧版'}，需要更新至 ${REQUIRED_BACKEND_VERSION}`
+            : status?.writable
+                ? `服务端已连接，可读写（v${detectedBackendVersion || REQUIRED_BACKEND_VERSION}）`
+                : '服务端未连接，请安装后端或重启酒馆';
         indicator.title = status?.error || '';
     }
     const installer = document.querySelector('#fml-backend-install-row');
-    if (installer) installer.hidden = Boolean(status?.enabled && status?.writable);
+    if (installer) {
+        installer.hidden = Boolean(status?.enabled && status?.writable && !status?.updateRequired);
+        const button = installer.querySelector('#fml-install-backend-settings');
+        if (button) button.innerHTML = `<i class="fa-solid fa-download"></i> ${status?.updateRequired ? '更新后端' : '安装后端'}`;
+        const description = installer.querySelector('small');
+        if (description) description.textContent = status?.updateRequired
+            ? '授权 SillyTavern/plugins 文件夹并覆盖旧后端，完成后重启酒馆。'
+            : '选择 SillyTavern/plugins 文件夹后写入后端，完成后重启酒馆。';
+    }
 }
 
 async function getBackendTemplateFiles() {
@@ -238,21 +271,25 @@ async function installBackendPluginFromHandle() {
 }
 
 function backendInstallerBody(message = '') {
+    const updating = backendUpdateRequired;
     return `
         <div class="fml-installer-copy">
-            <p>完整的资源下载功能需要酒馆服务端后端。它尚未被检测到。</p>
-            <p>点击安装后，请在系统选择框中选中 <code>SillyTavern/plugins</code> 文件夹。扩展会在其中写入 <code>frontend-media-localizer</code> 后端文件。</p>
+            <p>${updating
+                ? `检测到服务端版本 <code>${escapeHtml(detectedBackendVersion || '旧版')}</code>，当前前端要求至少 <code>${REQUIRED_BACKEND_VERSION}</code>。更新前已暂停资源扫描和下载。`
+                : '完整的资源下载功能需要酒馆服务端后端，目前尚未检测到可用版本。'}</p>
+            <p>点击${updating ? '更新' : '安装'}后，请在系统选择框中选中 <code>SillyTavern/plugins</code> 文件夹。扩展会${updating ? '覆盖更新' : '写入'}其中的 <code>frontend-media-localizer</code> 后端文件。</p>
             <p>安装完成后必须重启酒馆；若重启后仍未连接，请在 <code>config.yaml</code> 中启用 <code>enableServerPlugins: true</code>。</p>
             <div class="fml-installer-result">${escapeHtml(message)}</div>
         </div>
         <footer class="fml-modal-footer">
             <button class="menu_button fml-close-installer">稍后处理</button>
-            <button class="menu_button fml-install-backend"><i class="fa-solid fa-download"></i> 选择 plugins 文件夹并安装</button>
+            <button class="menu_button fml-install-backend"><i class="fa-solid fa-download"></i> 选择 plugins 文件夹并${updating ? '更新' : '安装'}</button>
         </footer>`;
 }
 
 function openBackendInstaller(message = '') {
-    const modal = createModal('安装资源本地化后端', backendInstallerBody(message), 'fml-backend-installer-modal');
+    const updating = backendUpdateRequired;
+    const modal = createModal(`${updating ? '更新' : '安装'}资源本地化后端`, backendInstallerBody(message), 'fml-backend-installer-modal');
     const result = modal.querySelector('.fml-installer-result');
     const installButton = modal.querySelector('.fml-install-backend');
     modal.querySelector('.fml-close-installer').addEventListener('click', closeModal);
@@ -265,7 +302,7 @@ function openBackendInstaller(message = '') {
                 result.textContent = '已取消，现有后端文件未被修改。';
                 return;
             }
-            result.textContent = '后端文件已写入。请完全重启酒馆，然后本扩展会自动连接。';
+            result.textContent = `后端文件已${updating ? '更新' : '写入'}。请完全重启酒馆，然后前端会自动复检版本。`;
             installButton.hidden = true;
         } catch (error) {
             if (error?.name === 'AbortError') result.textContent = '未选择文件夹，安装已取消。';
@@ -695,7 +732,7 @@ function updateScanSummary(modal, items) {
 
 async function probeCandidates(modal, items, allItems = items) {
     const batches = [];
-    for (let index = 0; index < items.length; index += 500) batches.push(items.slice(index, index + 500));
+    for (let index = 0; index < items.length; index += 1) batches.push(items.slice(index, index + 1));
     for (const batch of batches) {
         if (!modal.isConnected) return;
         batch.forEach(item => item.status = 'probing');
@@ -790,8 +827,8 @@ async function runDownloadQueue() {
 
 async function runDownloadTask(task) {
     const { cardName, items, selected } = task;
-    for (let index = 0; index < selected.length; index += 6) {
-        const batch = selected.slice(index, index + 6);
+    for (let index = 0; index < selected.length; index += 1) {
+        const batch = selected.slice(index, index + 1);
         batch.forEach(item => item.status = 'downloading');
         try {
             const data = await api('/download', {
@@ -1062,7 +1099,10 @@ jQuery(async () => {
     await handleCardChange();
     if (!serverAvailable && !backendInstallPrompted) {
         backendInstallPrompted = true;
-        setTimeout(() => openBackendInstaller(), 250);
+        const message = backendUpdateRequired
+            ? `检测到后端版本过旧，必须更新至 ${REQUIRED_BACKEND_VERSION} 后才能继续下载。`
+            : '';
+        setTimeout(() => openBackendInstaller(message), 250);
     }
     console.log('[FrontendMediaLocalizer] Extension initialized.');
 });

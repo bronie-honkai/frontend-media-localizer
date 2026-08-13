@@ -13,6 +13,7 @@ import sanitize from 'sanitize-filename';
 export const info = {
     id: 'frontend-media-localizer',
     name: 'Frontend Card Media Localizer',
+    version: '1.2.0',
     description: 'Downloads and serves frontend-card image, audio, and video resources from the SillyTavern data directory.',
 };
 
@@ -20,8 +21,22 @@ const MANIFEST_VERSION = 1;
 const MAX_REDIRECTS = 5;
 const MAX_RESOURCE_BYTES = 2 * 1024 * 1024 * 1024;
 const PROBE_TIMEOUT_MS = 5000;
+const REMOTE_REQUEST_INTERVAL_MS = 1000;
 const SUPPORTED_TYPES = new Set(['image', 'audio', 'video']);
 const SAFE_ID = /^[a-f0-9]{64}$/;
+
+let nextRemoteRequestAt = 0;
+let remoteRequestGate = Promise.resolve();
+
+async function waitForRemoteRequestSlot() {
+    const turn = remoteRequestGate.then(async () => {
+        const delay = Math.max(0, nextRemoteRequestAt - Date.now());
+        if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+        nextRemoteRequestAt = Date.now() + REMOTE_REQUEST_INTERVAL_MS;
+    });
+    remoteRequestGate = turn.catch(() => {});
+    await turn;
+}
 
 function resourcesRoot() {
     return path.resolve(globalThis.DATA_ROOT, 'resources');
@@ -135,6 +150,7 @@ async function fetchRemote(url, options = {}, timeoutMs = 15000) {
     let current = String(url);
     for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
         await assertSafeRemoteUrl(current);
+        await waitForRemoteRequestSlot();
         const response = await fetch(current, {
             ...options,
             redirect: 'manual',
@@ -354,22 +370,22 @@ export async function init(router) {
     router.get('/status', async (_request, response) => {
         try {
             await fs.promises.access(resourcesRoot(), fs.constants.R_OK | fs.constants.W_OK);
-            response.json({ enabled: true, writable: true, root: displayRoot() });
+            response.json({ enabled: true, writable: true, version: info.version, root: displayRoot() });
         } catch (error) {
-            response.status(500).json({ enabled: true, writable: false, root: displayRoot(), error: error.message });
+            response.status(500).json({ enabled: true, writable: false, version: info.version, root: displayRoot(), error: error.message });
         }
     });
 
     router.post('/probe', async (request, response) => {
         const resources = Array.isArray(request.body?.resources) ? request.body.resources.slice(0, 500) : [];
-        response.json({ resources: await mapLimit(resources, 20, probeOne) });
+        response.json({ resources: await mapLimit(resources, 1, probeOne) });
     });
 
     router.post('/download', async (request, response) => {
         const card = safeCardName(request.body?.card);
         const resources = Array.isArray(request.body?.resources) ? request.body.resources.slice(0, 12) : [];
         const manifest = await readManifest(card);
-        const results = await mapLimit(resources, 3, async item => {
+        const results = await mapLimit(resources, 1, async item => {
             try {
                 const record = await downloadOne(card, item, manifest);
                 return { ok: true, resource: publicRecord(card, record) };

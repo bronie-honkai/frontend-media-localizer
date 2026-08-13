@@ -3,7 +3,7 @@
   "display_name": "前端卡资源本地化",
   "description": "检测并本地化前端卡中的在线图片、音频和视频资源。",
   "author": "SillyTavern local extension",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "loading_order": 99,
   "js": "index.js",
   "css": "style.css"
