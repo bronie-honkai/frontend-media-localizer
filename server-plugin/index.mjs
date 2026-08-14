@@ -8,12 +8,13 @@ import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
 import mime from 'mime-types';
+import multer from 'multer';
 import sanitize from 'sanitize-filename';
 
 export const info = {
     id: 'frontend-media-localizer',
     name: 'Frontend Card Media Localizer',
-    version: '1.5.0',
+    version: '1.6.0',
     description: 'Downloads and serves frontend-card image, audio, and video resources from the SillyTavern data directory.',
 };
 
@@ -365,6 +366,65 @@ async function downloadOne(card, item, manifest, ratePolicy) {
     return record;
 }
 
+async function importUploadedResource(card, body, file) {
+    if (!file?.path || !Number.isFinite(file.size) || file.size <= 0) throw new Error('Uploaded resource is empty.');
+    if (file.size > MAX_RESOURCE_BYTES) throw new Error('Resource exceeds the 2 GiB per-file limit.');
+    const source = parseRemoteUrl(body?.source).href;
+    const type = String(body?.type ?? '');
+    if (!SUPPORTED_TYPES.has(type)) throw new Error('Unsupported media type.');
+    const requestedName = sanitize(String(body?.filename || file.originalname || '').trim(), { replacement: '_' })
+        .replace(/[. ]+$/g, '')
+        .slice(0, 180);
+    const contentType = normalizeMime(body?.contentType || file.mimetype)
+        || normalizeMime(requestedName && mime.lookup(requestedName))
+        || 'application/octet-stream';
+    if (!typeFromMime(contentType) && !isGenericBinaryMime(contentType)) {
+        throw new Error(`Unsupported content type: ${contentType}`);
+    }
+    const detectedType = typeFromMime(contentType)
+        ?? (requestedName ? typeFromUrl(`https://local.invalid/${encodeURIComponent(requestedName)}`) : null)
+        ?? typeFromUrl(source);
+    if (detectedType && detectedType !== type) throw new Error('Uploaded file type does not match the requested media type.');
+
+    const id = resourceId(source);
+    const filename = makeFilename(source, id, contentType, type);
+    const relativePath = path.posix.join(type, filename);
+    const typeDirectory = path.resolve(cardDirectory(card), type);
+    const parent = path.resolve(cardDirectory(card));
+    const targetPath = path.resolve(typeDirectory, filename);
+    if (!targetPath.startsWith(`${parent}${path.sep}`)) throw new Error('Invalid uploaded resource path.');
+    await fs.promises.mkdir(typeDirectory, { recursive: true });
+    const stagedPath = `${targetPath}.${process.pid}.${Date.now()}.part`;
+    await fs.promises.rename(file.path, stagedPath);
+    try {
+        const stat = await fs.promises.stat(stagedPath);
+        if (!stat.isFile() || stat.size <= 0) throw new Error('Uploaded resource is empty.');
+        if (stat.size > MAX_RESOURCE_BYTES) throw new Error('Resource exceeds the 2 GiB per-file limit.');
+        await fs.promises.rm(targetPath, { force: true });
+        await fs.promises.rename(stagedPath, targetPath);
+        const record = {
+            id,
+            source,
+            finalUrl: source,
+            type,
+            contentType,
+            size: stat.size,
+            relativePath,
+            filename,
+            downloadedAt: new Date().toISOString(),
+            status: 'downloaded',
+            importedBy: 'browser-blob-upload',
+        };
+        const manifest = await readManifest(card);
+        manifest.resources[id] = record;
+        await writeManifest(card, manifest);
+        return record;
+    } catch (error) {
+        await fs.promises.rm(stagedPath, { force: true }).catch(() => {});
+        throw error;
+    }
+}
+
 function encodedSource(value) {
     return Buffer.from(value, 'utf8').toString('base64url');
 }
@@ -400,6 +460,12 @@ async function openDirectory(target) {
 
 export async function init(router) {
     await fs.promises.mkdir(resourcesRoot(), { recursive: true });
+    const uploadDirectory = path.join(resourcesRoot(), '.upload-tmp');
+    await fs.promises.mkdir(uploadDirectory, { recursive: true });
+    const upload = multer({
+        dest: uploadDirectory,
+        limits: { fileSize: MAX_RESOURCE_BYTES, files: 1, fields: 8, fieldSize: 16 * 1024 },
+    });
 
     router.get('/status', async (_request, response) => {
         try {
@@ -431,6 +497,25 @@ export async function init(router) {
         });
         await writeManifest(card, manifest);
         response.json({ card, results });
+    });
+
+    router.post('/import-blob', (request, response) => {
+        upload.single('file')(request, response, async uploadError => {
+            if (uploadError) {
+                const status = uploadError?.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+                return response.status(status).json({ ok: false, error: String(uploadError.message ?? uploadError) });
+            }
+            const temporaryPath = request.file?.path;
+            try {
+                const card = safeCardName(request.body?.card);
+                const record = await importUploadedResource(card, request.body, request.file);
+                response.json({ ok: true, card, resource: publicRecord(card, record) });
+            } catch (error) {
+                response.status(400).json({ ok: false, error: String(error.message ?? error) });
+            } finally {
+                if (temporaryPath) await fs.promises.rm(temporaryPath, { force: true }).catch(() => {});
+            }
+        });
     });
 
     router.post('/register-local', async (request, response) => {
@@ -505,7 +590,9 @@ export async function init(router) {
 
     router.get('/cards', async (_request, response) => {
         const entries = await fs.promises.readdir(resourcesRoot(), { withFileTypes: true });
-        const directories = entries.filter(entry => entry.isDirectory()).map(entry => entry.name);
+        const directories = entries
+            .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
+            .map(entry => entry.name);
         const cards = await mapLimit(directories, 10, async directory => {
             const manifest = await readManifest(directory);
             const counts = { image: 0, audio: 0, video: 0 };

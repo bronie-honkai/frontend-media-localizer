@@ -16,7 +16,7 @@ const OFFLINE_PLACEHOLDER_PATH = `${EXTENSION_PUBLIC_PATH}/offline-placeholder.s
 const OFFLINE_BLOCKED_PATH = `${EXTENSION_PUBLIC_PATH}/offline-blocked`;
 const BACKEND_PLUGIN_FOLDER = 'frontend-media-localizer';
 const BACKEND_TEMPLATE_FILES = ['index.mjs', 'package.json'];
-const REQUIRED_BACKEND_VERSION = '1.5.0';
+const REQUIRED_BACKEND_VERSION = '1.6.0';
 const MEDIA_TYPES = ['image', 'audio', 'video'];
 const TYPE_LABELS = { image: '图片', audio: '音频', video: '视频' };
 const TYPE_ICONS = { image: 'fa-image', audio: 'fa-music', video: 'fa-film' };
@@ -69,8 +69,11 @@ let backendInstallPrompted = false;
 let backendUpdateRequired = false;
 let detectedBackendVersion = null;
 let latestLoadedResource = null;
-let sniffSeen = new Set();
 let sniffRecords = new Map();
+const sniffRecordIndex = new Map();
+const runtimeSessions = new Map();
+const runtimeSessionByDocument = new WeakMap();
+let runtimeSessionSequence = 0;
 let sniffAutoQueue = [];
 let sniffAutoRunnerActive = false;
 let resourceDirectoryHandle = null;
@@ -362,6 +365,19 @@ async function api(pathname, options = {}) {
     const response = await fetch(`${API_BASE}${pathname}`, {
         ...options,
         headers: { ...getRequestHeaders(), ...(options.headers ?? {}) },
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    return body;
+}
+
+async function apiUpload(pathname, formData) {
+    const headers = new Headers(getRequestHeaders());
+    headers.delete('content-type');
+    const response = await fetch(`${API_BASE}${pathname}`, {
+        method: 'POST',
+        headers,
+        body: formData,
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
@@ -770,8 +786,10 @@ function hotSwapDocumentResource(documentRef, source, localUrl, processedMedia) 
 }
 
 async function activateDownloadedResource(cardName, resource) {
-    if (!resource?.source || !resource?.localUrl || currentCard?.name !== cardName) return 0;
+    if (!resource?.source || !resource?.localUrl) return 0;
     const normalized = { ...resource, exists: true, status: 'downloaded' };
+    markSniffRecordSaved(cardName, normalized);
+    if (currentCard?.name !== cardName) return 0;
     libraryMutationSequence++;
     const index = currentLibrary.findIndex(item => item.id === normalized.id || item.source === normalized.source);
     if (index >= 0) currentLibrary[index] = { ...currentLibrary[index], ...normalized };
@@ -1237,6 +1255,7 @@ function rewriteIframe(iframe) {
 
 function bindDocumentMediaFallback(documentRef) {
     if (!documentRef || documentRef.documentElement?.dataset.fmlFallbackBound === 'true') return;
+    ensureRuntimeSession(documentRef);
     installDocumentRuntimeRouter(documentRef);
     documentRef.addEventListener('error', handleLocalizedMediaError, true);
     documentRef.addEventListener('load', handleMediaLoaded, true);
@@ -1249,7 +1268,7 @@ function bindDocumentMediaFallback(documentRef) {
     if (windowRef?.PerformanceObserver && !documentRef._fmlResourceObserver) {
         try {
             const observer = new windowRef.PerformanceObserver(list => {
-                for (const entry of list.getEntries()) processRuntimeResourceEntry(entry);
+                for (const entry of list.getEntries()) processRuntimeResourceEntry(entry, documentRef);
                 updateFloatingButton();
             });
             observer.observe({ type: 'resource', buffered: true });
@@ -1402,7 +1421,7 @@ function addRuntimeCandidate(source, type, reason) {
     updateSettingsSummary();
 }
 
-function observeRuntimeSource(sourceValue, typeHint, reason, actualValue = sourceValue) {
+function observeRuntimeSource(sourceValue, typeHint, reason, actualValue = sourceValue, documentRef = null) {
     if (!getSettings().enabled || !currentCard) return;
     const actual = String(actualValue || sourceValue || '');
     const source = decodeSourceParameter(actual) || reverseRouteMap.get(actual) || normalizeCandidate(sourceValue);
@@ -1411,8 +1430,17 @@ function observeRuntimeSource(sourceValue, typeHint, reason, actualValue = sourc
     if (!MEDIA_TYPES.includes(type)) return;
     addRuntimeCandidate(source, type, reason);
     const local = Boolean(canonicalLocalRoute(actual));
-    if (getSettings().sniffingEnabled && !local) {
-        registerSniffedResource({ source, actual, type, local: false, cardName: currentCard.name });
+    if (getSettings().sniffingEnabled) {
+        const session = touchRuntimeSession(documentRef, reason);
+        registerSniffedResource({
+            source,
+            actual,
+            type,
+            local,
+            cardName: currentCard.name,
+            sessionId: session?.id || null,
+            reason,
+        });
     }
 }
 
@@ -1424,13 +1452,13 @@ function observeRuntimeValue(element, attribute, value, reason = '') {
         collectFromString(value, context, found);
         for (const item of found.values()) {
             const type = runtimeTypeForElement(element, item.url, context) || item.type;
-            observeRuntimeSource(item.url, type, context);
+            observeRuntimeSource(item.url, type, context, item.url, element?.ownerDocument || null);
         }
         return;
     }
     const normalized = decodeSourceParameter(value) || reverseRouteMap.get(value) || normalizeCandidate(value);
     if (!normalized) return;
-    observeRuntimeSource(normalized, runtimeTypeForElement(element, normalized, context), context, value);
+    observeRuntimeSource(normalized, runtimeTypeForElement(element, normalized, context), context, value, element?.ownerDocument || null);
 }
 
 function observeMediaElementActivity(element, reason) {
@@ -1439,7 +1467,15 @@ function observeMediaElementActivity(element, reason) {
     rememberMediaElement(element);
     addRuntimeCandidate(info.source, info.type, reason);
     setLatestLoadedResource(info, reason);
-    if (getSettings().sniffingEnabled && !info.local) registerSniffedResource(info);
+    if (getSettings().sniffingEnabled) {
+        const session = touchRuntimeSession(element.ownerDocument, reason)
+            || (element.ownerDocument === document ? activeRuntimeSession() : null);
+        if (session && element.ownerDocument === document) {
+            session.lastActivityAt = Date.now();
+            session.lastActivityReason = reason;
+        }
+        registerSniffedResource({ ...info, cardName: currentCard?.name, sessionId: session?.id || null, reason });
+    }
 }
 
 function setLatestLoadedResource(info, reason) {
@@ -1497,17 +1533,185 @@ function sniffRecordKey(cardName, source) {
     return `${cardName || ''}\n${source}`;
 }
 
-function registerSniffedResource(info) {
+function runtimeFrameForDocument(documentRef) {
+    if (!documentRef || documentRef === document) return null;
+    try { return documentRef.defaultView?.frameElement || null; } catch { return null; }
+}
+
+function runtimeMessageId(iframe) {
+    const value = iframe?.closest?.('#chat > .mes')?.getAttribute('mesid');
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : -1;
+}
+
+function isElementInCurrentScene(element) {
+    if (!element?.isConnected) return false;
+    const target = String(element.tagName || '').toLowerCase() === 'source' ? element.parentElement : element;
+    if (!target?.isConnected) return false;
+    try {
+        const style = target.ownerDocument.defaultView?.getComputedStyle(target);
+        if (style?.display === 'none' || style?.visibility === 'hidden' || Number(style?.opacity) === 0) return false;
+        const rect = target.getBoundingClientRect();
+        const width = target.ownerDocument.documentElement?.clientWidth || target.ownerDocument.defaultView?.innerWidth || 0;
+        const height = target.ownerDocument.documentElement?.clientHeight || target.ownerDocument.defaultView?.innerHeight || 0;
+        return rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.bottom > 0 && rect.left < width && rect.top < height;
+    } catch { return false; }
+}
+
+function isRuntimeFrameVisible(iframe) {
+    if (!iframe?.isConnected) return false;
+    try {
+        const style = getComputedStyle(iframe);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+        const rect = iframe.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.bottom > 0
+            && rect.left < window.innerWidth && rect.top < window.innerHeight;
+    } catch { return false; }
+}
+
+function pruneRuntimeSessions() {
+    for (const [id, session] of runtimeSessions) {
+        let currentDocument = null;
+        try { currentDocument = session.iframe?.contentDocument || null; } catch { /* cross-origin iframe */ }
+        if (session.iframe?.isConnected && session.documentRef?.defaultView && currentDocument === session.documentRef) continue;
+        runtimeSessions.delete(id);
+    }
+}
+
+function touchRuntimeSession(documentRef, reason = '') {
+    const session = ensureRuntimeSession(documentRef);
+    if (!session) return null;
+    session.lastActivityAt = Date.now();
+    session.lastActivityReason = reason;
+    return session;
+}
+
+function ensureRuntimeSession(documentRef, allowCardRebind = false) {
+    if (!documentRef || documentRef === document || !currentCard) return null;
+    const existing = runtimeSessionByDocument.get(documentRef);
+    if (existing && existing.cardName === currentCard.name) return existing;
+    if (existing && !allowCardRebind) return null;
+    const iframe = runtimeFrameForDocument(documentRef);
+    if (!iframe) return null;
+    const now = Date.now();
+    const session = {
+        id: `runtime-${++runtimeSessionSequence}`,
+        cardName: currentCard.name,
+        storageCardName: currentStorageCardName || currentCard.name,
+        iframe,
+        documentRef,
+        messageId: runtimeMessageId(iframe),
+        createdAt: now,
+        lastActivityAt: now,
+        lastActivityReason: 'iframe 初始化',
+        recordIds: new Set(),
+    };
+    runtimeSessionByDocument.set(documentRef, session);
+    runtimeSessions.set(session.id, session);
+    if (!documentRef._fmlRuntimeActivityBound) {
+        const markActive = event => touchRuntimeSession(documentRef, `用户交互：${event.type}`);
+        for (const eventName of ['pointerdown', 'touchstart', 'keydown', 'focusin']) {
+            documentRef.addEventListener(eventName, markActive, { capture: true, passive: eventName !== 'keydown' });
+        }
+        documentRef._fmlRuntimeActivityBound = true;
+    }
+    pruneRuntimeSessions();
+    return session;
+}
+
+function activeRuntimeSession() {
+    pruneRuntimeSessions();
+    if (!currentCard) return null;
+    document.querySelectorAll('#chat iframe').forEach(iframe => {
+        if (!isRuntimeFrameVisible(iframe)) return;
+        try { ensureRuntimeSession(iframe.contentDocument); } catch { /* cross-origin iframe */ }
+    });
+    const sessions = [...runtimeSessions.values()]
+        .filter(session => session.cardName === currentCard.name && isRuntimeFrameVisible(session.iframe));
+    sessions.sort((left, right) => right.lastActivityAt - left.lastActivityAt
+        || right.messageId - left.messageId
+        || right.createdAt - left.createdAt);
+    return sessions[0] || null;
+}
+
+function registerSniffedResource(info, options = {}) {
     const settings = getSettings();
     const cardName = info.cardName || currentCard?.name;
     if (!settings.enabled || !cardName || !MEDIA_TYPES.includes(info.type) || settings.sniffBlockedUrls.includes(info.source)) return;
     const key = sniffRecordKey(cardName, info.source);
-    if (sniffSeen.has(key) || currentLibrary.some(item => item.exists && item.source === info.source)) return;
-    sniffSeen.add(key);
-    const record = { ...info, id: crypto.randomUUID(), cardName, storageCardName: currentStorageCardName || cardName, state: 'ready', directFailed: false, createdAt: Date.now() };
+    const now = Date.now();
+    const localResource = cardName === currentCard?.name && currentLibrary.find(item => item.exists && item.source === info.source);
+    const existing = sniffRecords.get(sniffRecordIndex.get(key));
+    if (existing) {
+        const wasSaved = existing.state === 'saved';
+        existing.actual = info.actual || existing.actual;
+        existing.local = Boolean(info.local || localResource);
+        existing.lastSeenAt = now;
+        existing.lastReason = info.reason || existing.lastReason;
+        if (info.sessionId) {
+            existing.sessionIds.add(info.sessionId);
+            runtimeSessions.get(info.sessionId)?.recordIds.add(existing.id);
+        }
+        if (existing.local && existing.state !== 'saving') {
+            existing.state = 'saved';
+            existing.localMissing = false;
+            existing.error = null;
+            existing.directFailed = false;
+            if (localResource) existing.saved = localResource;
+        } else if (wasSaved && serverAvailable && cardName === currentCard?.name) {
+            existing.state = 'ready';
+            existing.localMissing = true;
+            existing.saved = null;
+            existing.error = null;
+            existing.directFailed = false;
+            if (options.notify !== false && settings.sniffNotifications) showSniffNotification(existing);
+            if (options.autoDownload !== false && settings.sniffAutoDownload && !settings.offlineMode) enqueueSniffAutoDownload(existing);
+        }
+        return existing;
+    }
+    const downloaded = Boolean(info.local || localResource);
+    const record = {
+        ...info,
+        id: crypto.randomUUID(),
+        cardName,
+        storageCardName: currentStorageCardName || cardName,
+        state: downloaded ? 'saved' : 'ready',
+        directFailed: false,
+        createdAt: now,
+        lastSeenAt: now,
+        lastReason: info.reason || '',
+        sessionIds: new Set(info.sessionId ? [info.sessionId] : []),
+        saved: localResource || null,
+    };
     sniffRecords.set(record.id, record);
-    if (settings.sniffNotifications) showSniffNotification(record);
-    if (settings.sniffAutoDownload && !settings.offlineMode) enqueueSniffAutoDownload(record);
+    sniffRecordIndex.set(key, record.id);
+    if (info.sessionId) runtimeSessions.get(info.sessionId)?.recordIds.add(record.id);
+    const shouldNotify = options.notify !== false && !downloaded && settings.sniffNotifications;
+    const shouldAutoDownload = options.autoDownload !== false && !downloaded && settings.sniffAutoDownload && !settings.offlineMode;
+    if (shouldNotify) showSniffNotification(record);
+    if (shouldAutoDownload) enqueueSniffAutoDownload(record);
+    return record;
+}
+
+function markSniffRecordSaved(cardName, resource) {
+    const record = sniffRecords.get(sniffRecordIndex.get(sniffRecordKey(cardName, resource?.source)));
+    if (!record) return;
+    record.state = 'saved';
+    record.local = true;
+    record.localMissing = false;
+    record.directFailed = false;
+    record.error = null;
+    record.saved = resource;
+    updateSniffNotification(record);
+}
+
+function markSniffRecordFailed(cardName, source, error) {
+    const record = sniffRecords.get(sniffRecordIndex.get(sniffRecordKey(cardName, source)));
+    if (!record) return;
+    record.state = 'failed';
+    record.directFailed = true;
+    record.error = String(error || '下载失败');
+    updateSniffNotification(record);
 }
 
 function clearSniffNotifications() {
@@ -1565,10 +1769,17 @@ function showOfflineMissingNotice(source, type) {
 }
 
 function sniffStatusLabel(record) {
-    if (record.state === 'saving') return '正在保存…';
+    if (record.state === 'saving') {
+        if (record.recoveryStage === 'direct') return '第 1 次：服务端直接下载…';
+        if (record.recoveryStage === 'browser-read') return '第 2 次：读取浏览器资源…';
+        if (record.recoveryStage === 'server-upload') return '第 2 次：上传到酒馆服务端…';
+        if (record.recoveryStage === 'directory-handle') return '第 3 次：写入备用授权目录…';
+        if (record.recoveryStage === 'manual-import') return '第 4 次：导入浏览器下载文件…';
+        return '正在保存…';
+    }
     if (record.state === 'saved') return '已保存到本地';
     if (record.state === 'awaiting-import') return '浏览器下载完成后点击导入';
-    if (record.state === 'failed') return record.error || '直接保存失败';
+    if (record.state === 'failed') return record.error || '保存失败';
     return record.local ? '本地资源' : '发现云端资源';
 }
 
@@ -1598,7 +1809,7 @@ function renderSniffNotification(element, record) {
     element.innerHTML = `
         <i class="fa-solid ${TYPE_ICONS[record.type]} fml-sniff-type"></i>
         <span class="fml-sniff-copy"><strong title="${escapeHtml(record.source)}">${escapeHtml(filename)}</strong><small>${escapeHtml(sniffStatusLabel(record))}</small></span>
-        <button class="fml-sniff-icon fml-sniff-download" title="${record.state === 'awaiting-import' ? '导入刚才由浏览器下载的文件' : record.directFailed ? '写入已授权资源目录' : '下载到酒馆服务器资源目录'}"><i class="fa-solid ${notificationActionIcon(record)}"></i></button>
+        <button class="fml-sniff-icon fml-sniff-download" title="${record.state === 'awaiting-import' ? '导入刚才由浏览器下载的文件' : record.directFailed ? '启动四级浏览器补偿保存' : '下载到酒馆服务器资源目录'}"><i class="fa-solid ${notificationActionIcon(record)}"></i></button>
         <button class="fml-sniff-icon fml-sniff-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>
         <button class="fml-sniff-icon fml-sniff-more" title="更多"><i class="fa-solid fa-ellipsis"></i></button>
         <button class="fml-sniff-block" hidden>不再通知此资源</button>`;
@@ -1608,6 +1819,8 @@ function renderSniffNotification(element, record) {
 
 function showSniffNotification(record) {
     if (!getSettings().enabled || !getSettings().sniffingEnabled || !getSettings().sniffNotifications) return;
+    if (record.cardName !== currentCard?.name || record.state === 'saved') return;
+    record.lastNotifiedAt = Date.now();
     const container = ensureSniffContainer();
     let element = container.querySelector(`[data-record-id="${CSS.escape(record.id)}"]`);
     if (!element) {
@@ -1615,6 +1828,10 @@ function showSniffNotification(record) {
         container.append(element);
         element.addEventListener('mouseenter', () => clearTimeout(element._fmlTimer));
         element.addEventListener('mouseleave', () => scheduleSniffNotification(element, record));
+        element.addEventListener('focusin', () => clearTimeout(element._fmlTimer));
+        element.addEventListener('focusout', event => {
+            if (!element.contains(event.relatedTarget)) scheduleSniffNotification(element, record);
+        });
     }
     renderSniffNotification(element, record);
     if (!element.dataset.animated) {
@@ -1685,13 +1902,36 @@ function safeDirectoryName(value, fallback) {
 
 async function chooseResourceDirectory() {
     if (!window.showDirectoryPicker) throw new Error('当前浏览器不支持文件夹授权');
-    const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    const pickerOptions = { mode: 'readwrite', id: 'fml-resources' };
+    if (resourceDirectoryHandle) pickerOptions.startIn = resourceDirectoryHandle;
+    const handle = await window.showDirectoryPicker(pickerOptions);
     if (String(handle.name || '').toLowerCase() !== 'resources') throw new Error('请选择 SillyTavern/data/resources 文件夹');
     if (!await handlePermission(handle, true)) throw new Error('未取得目录读写权限');
     resourceDirectoryHandle = handle;
     await storeResourceHandle(handle);
     updateHandleStatus();
     return handle;
+}
+
+async function authorizeResourceDirectory() {
+    if (!resourceDirectoryHandle) resourceDirectoryHandle = await readStoredHandle().catch(() => null);
+    if (!resourceDirectoryHandle) return chooseResourceDirectory();
+    if (String(resourceDirectoryHandle.name || '').toLowerCase() !== 'resources') {
+        resourceDirectoryHandle = null;
+        updateHandleStatus();
+        toastr.warning('原有目录不是 resources，请重新确认正确目录', '资源嗅探');
+        return chooseResourceDirectory();
+    }
+    const permission = await resourceDirectoryHandle.queryPermission({ mode: 'readwrite' });
+    if (permission === 'granted') {
+        updateHandleStatus();
+        return resourceDirectoryHandle;
+    }
+    const result = await resourceDirectoryHandle.requestPermission({ mode: 'readwrite' });
+    if (result !== 'granted') throw new Error('未取得 resources 目录读写权限');
+    await storeResourceHandle(resourceDirectoryHandle);
+    updateHandleStatus();
+    return resourceDirectoryHandle;
 }
 
 async function requireResourceDirectory(interactive = true) {
@@ -1772,6 +2012,7 @@ async function syncPendingRegistrations() {
 
 async function saveSniffRecordDirect(record, interactive = true) {
     record.state = 'saving';
+    record.recoveryStage = 'direct';
     record.error = null;
     updateSniffNotification(record);
     try {
@@ -1790,12 +2031,14 @@ async function saveSniffRecordDirect(record, interactive = true) {
         await activateDownloadedResource(record.cardName, saved);
         refreshAllCardsInline();
         record.state = 'saved';
+        record.recoveryStage = null;
         record.directFailed = false;
         record.saved = saved;
         updateSniffNotification(record);
         return saved;
     } catch (error) {
         record.state = 'failed';
+        record.recoveryStage = null;
         record.directFailed = true;
         record.error = String(error.message || error);
         updateSniffNotification(record);
@@ -1805,8 +2048,13 @@ async function saveSniffRecordDirect(record, interactive = true) {
 
 async function readSniffBlobFromBrowser(record) {
     const source = String(record.actual || record.source || '');
+    record.state = 'saving';
+    record.recoveryStage = 'browser-read';
+    record.error = null;
+    updateSniffNotification(record);
     let response;
     try {
+        await waitForSniffRequestSlot(source);
         response = await fetch(source, {
             method: 'GET',
             mode: 'cors',
@@ -1830,23 +2078,38 @@ async function readSniffBlobFromBrowser(record) {
     return blob;
 }
 
-async function saveSniffRecordToAuthorizedDirectory(record) {
+async function uploadSniffBlobToServer(record, blob, preferredFilename = '', recoveryStage = 'server-upload') {
     record.state = 'saving';
+    record.recoveryStage = recoveryStage;
     record.error = null;
     updateSniffNotification(record);
     try {
-        await requireResourceDirectory(true);
-        const blob = await readSniffBlobFromBrowser(record);
-        const saved = await writeBlobToResourceDirectory(record, blob, sniffFilename(record.source, record.type, blob.type), true);
-        const registered = await registerSavedResource(record, saved);
+        if (!serverAvailable) {
+            await checkServer();
+            if (!serverAvailable) throw new Error('酒馆服务器端插件未连接');
+        }
+        const filename = preferredFilename || sniffFilename(record.source, record.type, blob.type);
+        const formData = new FormData();
+        formData.append('card', record.cardName);
+        formData.append('source', record.source);
+        formData.append('type', record.type);
+        formData.append('filename', filename);
+        formData.append('contentType', blob.type || 'application/octet-stream');
+        formData.append('file', blob, filename);
+        const data = await apiUpload('/import-blob', formData);
+        if (!data?.resource) throw new Error('服务端未返回已导入资源');
+        await activateDownloadedResource(record.cardName, data.resource);
+        refreshAllCardsInline();
         record.state = 'saved';
+        record.recoveryStage = null;
         record.directFailed = false;
-        record.saved = registered || saved;
+        record.saved = data.resource;
         updateSniffNotification(record);
-        toastr.success(`已保存到 resources/${safeDirectoryName(record.storageCardName || record.cardName, 'Unnamed Character')}/${record.type}`, '资源嗅探');
-        return record.saved;
+        toastr.success('浏览器资源已上传到酒馆本地目录并更新映射', '资源嗅探');
+        return data.resource;
     } catch (error) {
         record.state = 'failed';
+        record.recoveryStage = null;
         record.directFailed = true;
         record.error = String(error.message || error);
         updateSniffNotification(record);
@@ -1854,15 +2117,50 @@ async function saveSniffRecordToAuthorizedDirectory(record) {
     }
 }
 
-function triggerBrowserSaveAs(record) {
+async function saveSniffRecordToAuthorizedDirectory(record, blob, preferredFilename = '') {
+    record.state = 'saving';
+    record.recoveryStage = 'directory-handle';
+    record.error = null;
+    updateSniffNotification(record);
+    try {
+        await requireResourceDirectory(false);
+        const saved = await writeBlobToResourceDirectory(
+            record,
+            blob,
+            preferredFilename || sniffFilename(record.source, record.type, blob.type),
+            false,
+        );
+        const registered = await registerSavedResource(record, saved);
+        record.state = 'saved';
+        record.recoveryStage = null;
+        record.directFailed = false;
+        record.saved = registered || saved;
+        updateSniffNotification(record);
+        toastr.success(`已通过备用句柄保存到 resources/${safeDirectoryName(record.storageCardName || record.cardName, 'Unnamed Character')}/${record.type}`, '资源嗅探');
+        return record.saved;
+    } catch (error) {
+        record.state = 'failed';
+        record.recoveryStage = null;
+        record.directFailed = true;
+        record.error = String(error.message || error);
+        updateSniffNotification(record);
+        throw error;
+    }
+}
+
+function triggerBrowserSaveAs(record, blob = null) {
     const anchor = document.createElement('a');
-    anchor.href = record.source;
+    const objectUrl = blob ? URL.createObjectURL(blob) : null;
+    anchor.href = objectUrl || record.source;
     anchor.download = sniffFilename(record.source, record.type);
-    anchor.target = '_blank';
-    anchor.rel = 'noopener noreferrer';
+    if (!objectUrl) {
+        anchor.target = '_blank';
+        anchor.rel = 'noopener noreferrer';
+    }
     document.body.append(anchor);
     anchor.click();
     anchor.remove();
+    if (objectUrl) setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
 }
 
 async function pickImportedFile(record) {
@@ -1882,32 +2180,75 @@ async function pickImportedFile(record) {
     if (!file?.size) throw new Error('选择的文件为空');
     const major = String(file.type || '').split('/')[0];
     if (major && major !== record.type) throw new Error(`请选择${TYPE_LABELS[record.type]}文件`);
-    const saved = await writeBlobToResourceDirectory(record, file, file.name, true);
-    await registerSavedResource(record, saved);
-    record.state = 'saved';
-    record.saved = saved;
+    record.state = 'saving';
+    record.recoveryStage = 'manual-import';
+    record.error = null;
     updateSniffNotification(record);
+    try {
+        return await uploadSniffBlobToServer(record, file, file.name, 'manual-import');
+    } catch (uploadError) {
+        try {
+            return await saveSniffRecordToAuthorizedDirectory(record, file, file.name);
+        } catch (handleError) {
+            throw new Error(`手动文件上传失败：${uploadError.message || uploadError}；备用目录也不可用：${handleError.message || handleError}`);
+        }
+    }
 }
 
 async function handleManualSniffSave(record) {
     try {
         if (record.state === 'awaiting-import') return await pickImportedFile(record);
-        if (!record.directFailed) return await saveSniffRecordDirect(record, true);
-        if (!getSettings().sniffSaveAs) return toastr.info('请先在资源嗅探设置中开启“失败后允许另存为”', '资源嗅探');
-        if (!confirm('酒馆服务器直接下载失败。是否把浏览器已加载的资源直接写入已授权的 resources/角色卡/类型目录？')) return;
+        if (!record.directFailed) {
+            try { return await saveSniffRecordDirect(record, true); }
+            catch (error) {
+                if (!getSettings().sniffSaveAs) throw error;
+            }
+        }
+        if (!getSettings().sniffSaveAs) return toastr.info('请先在资源嗅探设置中开启“失败后启用补偿保存”', '资源嗅探');
+        if (!confirm('服务端直接下载失败。是否启动浏览器补偿流程？浏览器只读取一次资源，随后依次尝试上传酒馆、备用目录，最后才使用普通下载。')) return;
+        let blob;
         try {
-            return await saveSniffRecordToAuthorizedDirectory(record);
-        } catch (error) {
-            if (error?.name === 'AbortError') return;
-            const useBrowserDownload = confirm(`${error.message || String(error)}\n\n无法直接写入授权目录。是否改用浏览器默认下载？下载完成后再次点击通知按钮即可导入并登记映射。`);
-            if (!useBrowserDownload) return toastr.error(error.message || String(error), '资源嗅探');
+            blob = await readSniffBlobFromBrowser(record);
+        } catch (readError) {
+            if (readError?.name === 'AbortError') return;
+            const useBrowserDownload = confirm(`${readError.message || String(readError)}\n\n浏览器无法读取资源。是否进入第 4 次普通下载？下载完成后再次点击通知按钮并选择该文件即可导入。`);
+            if (!useBrowserDownload) throw readError;
             triggerBrowserSaveAs(record);
             record.state = 'awaiting-import';
+            record.recoveryStage = null;
             record.error = null;
             updateSniffNotification(record);
+            return;
         }
+        let uploadError;
+        try {
+            return await uploadSniffBlobToServer(record, blob);
+        } catch (error) {
+            uploadError = error;
+            console.warn('[FrontendMediaLocalizer] 第 2 次浏览器 Blob 上传失败，准备复用同一 Blob 尝试备用句柄:', error);
+        }
+        let handleError;
+        try {
+            return await saveSniffRecordToAuthorizedDirectory(record, blob);
+        } catch (error) {
+            handleError = error;
+            console.warn('[FrontendMediaLocalizer] 第 3 次备用目录保存失败，准备进入普通下载:', error);
+        }
+        const useBrowserDownload = confirm(`第 2 次上传酒馆失败：${uploadError?.message || uploadError}\n第 3 次备用目录失败：${handleError?.message || handleError}\n\n是否进入第 4 次普通浏览器下载？下载完成后再次点击通知按钮并选择该文件即可导入。`);
+        if (!useBrowserDownload) throw handleError || uploadError;
+        triggerBrowserSaveAs(record, blob);
+        record.state = 'awaiting-import';
+        record.recoveryStage = null;
+        record.error = null;
+        updateSniffNotification(record);
     } catch (error) {
-        if (error?.name !== 'AbortError') toastr.error(error.message || String(error), '资源嗅探');
+        if (error?.name !== 'AbortError') {
+            record.state = 'failed';
+            record.recoveryStage = null;
+            record.error = String(error.message || error);
+            updateSniffNotification(record);
+            toastr.error(error.message || String(error), '资源嗅探');
+        }
     }
 }
 
@@ -1924,14 +2265,17 @@ function scanLoadedMedia(documentRef) {
 
 function collectRuntimeResources(iframe) {
     if (!iframe?.contentWindow) return;
+    const documentRef = iframe.contentDocument;
+    ensureRuntimeSession(documentRef, true);
+    touchRuntimeSession(documentRef, 'iframe 资源收集');
     let entries = [];
     try { entries = iframe.contentWindow.performance.getEntriesByType('resource'); } catch { return; }
-    for (const entry of entries) processRuntimeResourceEntry(entry);
-    scanLoadedMedia(iframe.contentDocument);
+    for (const entry of entries) processRuntimeResourceEntry(entry, documentRef);
+    scanLoadedMedia(documentRef);
     updateFloatingButton();
 }
 
-function processRuntimeResourceEntry(entry) {
+function processRuntimeResourceEntry(entry, documentRef = null) {
     if (!getSettings().enabled) return;
     if (!['img', 'audio', 'video'].includes(entry?.initiatorType) && !inferType(entry?.name)) return;
     const url = normalizeCandidate(entry.name);
@@ -1957,9 +2301,133 @@ function processRuntimeResourceEntry(entry) {
         console.debug('[FrontendMediaLocalizer] 忽略已映射资源的旧云端性能记录', { 原始链接: url, 本地链接: localUrl });
         return;
     }
-    const info = { source: url, actual: url, type, local: false, cardName: currentCard?.name || null };
+    const session = touchRuntimeSession(documentRef, '浏览器运行时资源记录');
+    const info = {
+        source: url,
+        actual: url,
+        type,
+        local: false,
+        cardName: currentCard?.name || null,
+        sessionId: session?.id || null,
+        reason: '浏览器运行时资源记录',
+    };
     setLatestLoadedResource(info, '浏览器运行时资源记录');
     if (getSettings().enabled && getSettings().sniffingEnabled) registerSniffedResource(info);
+}
+
+function recordManualSceneResource(info, session, reason, flags = {}) {
+    if (!info?.source || !session) return null;
+    addRuntimeCandidate(info.source, info.type, reason);
+    const record = registerSniffedResource({
+        ...info,
+        cardName: session.cardName,
+        storageCardName: session.storageCardName,
+        sessionId: session.id,
+        reason,
+    }, { notify: false, autoDownload: false });
+    if (!record) return null;
+    record.lastSeenAt = Date.now();
+    record.sceneVisible = Boolean(flags.visible);
+    record.scenePlaying = Boolean(flags.playing);
+    session.recordIds.add(record.id);
+    return record;
+}
+
+function collectCurrentSceneRecords(session) {
+    const documentRef = session?.documentRef;
+    if (!documentRef?.documentElement) return [];
+    const active = new Map();
+    const rememberElement = element => {
+        const info = mediaInfoFromElement(element);
+        if (!info) return;
+        const target = String(element.tagName || '').toLowerCase() === 'source' ? element.parentElement : element;
+        const tag = String(target?.tagName || '').toLowerCase();
+        const visible = isElementInCurrentScene(target);
+        const playing = ['audio', 'video'].includes(tag) && !target.paused && !target.ended;
+        const loadedImage = tag === 'img' && target.complete && target.naturalWidth > 0;
+        const loadedMedia = ['audio', 'video'].includes(tag) && Number(target.readyState) >= 1;
+        if (!(playing || (visible && (loadedImage || loadedMedia)))) return;
+        const record = recordManualSceneResource(info, session, '手动嗅探：当前媒体元素', { visible, playing });
+        if (record) active.set(record.id, record);
+    };
+
+    documentRef.querySelectorAll('img[src], audio[src], video[src], source[src]').forEach(rememberElement);
+    for (const media of trackedMediaElements) {
+        if (![documentRef, document].includes(media?.ownerDocument) || media.paused || media.ended) continue;
+        rememberElement(media);
+    }
+
+    const elements = [...documentRef.querySelectorAll('body *')].slice(0, 2000);
+    for (const element of elements) {
+        if (!isElementInCurrentScene(element)) continue;
+        let background = '';
+        try { background = documentRef.defaultView?.getComputedStyle(element)?.backgroundImage || ''; } catch { continue; }
+        if (!background || background === 'none' || !background.includes('url(')) continue;
+        URL_PATTERN.lastIndex = 0;
+        for (const match of background.matchAll(URL_PATTERN)) {
+            const actual = match[0].trim().replace(/[),;\]}]+$/g, '');
+            const source = decodeSourceParameter(actual) || reverseRouteMap.get(actual) || normalizeCandidate(actual);
+            if (!source) continue;
+            const record = recordManualSceneResource({
+                source,
+                actual,
+                type: 'image',
+                local: Boolean(canonicalLocalRoute(actual)),
+            }, session, '手动嗅探：当前可见背景图', { visible: true, playing: false });
+            if (record) active.set(record.id, record);
+        }
+    }
+    return [...active.values()];
+}
+
+function currentCardSniffRecords() {
+    if (!currentCard) return [];
+    const known = new Map(currentLibrary.filter(item => item.exists).map(item => [item.source, item]));
+    return [...sniffRecords.values()]
+        .filter(record => record.cardName === currentCard.name)
+        .map(record => {
+            const local = known.get(record.source);
+            if (local && record.state !== 'saving') {
+                record.state = 'saved';
+                record.local = true;
+                record.localMissing = false;
+                record.saved = local;
+                record.error = null;
+            } else if (!local && (record.local || record.state === 'saved') && serverAvailable) {
+                record.local = false;
+                record.localMissing = true;
+                record.state = 'ready';
+                record.saved = null;
+            }
+            return record;
+        })
+        .sort((left, right) => (right.lastSeenAt || right.createdAt) - (left.lastSeenAt || left.createdAt));
+}
+
+function manualResniffCurrentScene() {
+    const settings = getSettings();
+    if (!settings.enabled || !currentCard) return toastr.info('当前没有可嗅探的角色卡', '资源嗅探');
+    if (!settings.sniffingEnabled) return toastr.info('请先在扩展设置中开启“启用资源嗅探”', '资源嗅探');
+    if (!settings.sniffNotifications) return toastr.info('请先开启“接收嗅探通知”，或使用右下角列表查看记录', '资源嗅探');
+    const session = activeRuntimeSession();
+    if (!session) return toastr.info('没有找到当前可见的前端卡运行窗口', '资源嗅探');
+    touchRuntimeSession(session.documentRef, '手动重新嗅探');
+    const active = collectCurrentSceneRecords(session);
+    const activeIds = new Set(active.map(record => record.id));
+    const recentWindow = Math.max(30000, (Number(settings.sniffNotificationSeconds) || 5) * 4000);
+    const now = Date.now();
+    const candidates = [...session.recordIds]
+        .map(id => sniffRecords.get(id))
+        .filter(record => record && record.cardName === currentCard.name && record.state !== 'saved')
+        .filter(record => activeIds.has(record.id) || now - (record.lastSeenAt || record.createdAt) <= recentWindow)
+        .sort((left, right) => Number(activeIds.has(right.id)) - Number(activeIds.has(left.id))
+            || Number(Boolean(right.scenePlaying)) - Number(Boolean(left.scenePlaying))
+            || (right.lastSeenAt || right.createdAt) - (left.lastSeenAt || left.createdAt));
+    const maximum = Math.max(1, Math.min(20, Number(settings.sniffMaxNotifications) || 3));
+    const selected = candidates.slice(0, maximum);
+    selected.forEach(record => showSniffNotification(record));
+    if (!selected.length) return toastr.info('当前场景没有未下载或失败的资源；可点击右下角列表查看全部记录', '资源嗅探');
+    toastr.info(`已重新显示 ${selected.length} 条当前场景资源`, `${currentCard.name} · 资源嗅探`);
 }
 
 async function handleCardChange() {
@@ -1971,7 +2439,6 @@ async function handleCardChange() {
     currentCandidates = card ? collectRemoteResources(card.character) : new Map();
     currentLibrary = [];
     latestLoadedResource = null;
-    sniffSeen = new Set();
     clearSniffNotifications();
     setRouteMap([]);
     if (card && serverAvailable) await loadLibrary(card.name).catch(error => toastr.error(error.message, '资源本地化'));
@@ -2126,7 +2593,7 @@ function bindFloatingDrag(button) {
     let ignoreMouseUntil = 0;
     const pointFromEvent = event => event.touches?.[0] || event.changedTouches?.[0] || event;
     const start = event => {
-        if (event.target.closest('.fml-floating-close') || (event.pointerType === 'mouse' && event.button !== 0)) return;
+        if (event.target.closest('.fml-floating-control') || (event.pointerType === 'mouse' && event.button !== 0)) return;
         if (drag) return;
         const point = pointFromEvent(event);
         const rect = button.getBoundingClientRect();
@@ -2218,13 +2685,23 @@ function injectFloatingButton() {
             <small class="fml-progress-count">0/0</small>
         </span>
         <span class="fml-floating-badge" hidden>0</span>
-        <button class="fml-floating-close" type="button" title="关闭悬浮球" aria-label="关闭悬浮球"><i class="fa-solid fa-xmark"></i></button>`;
-    button.querySelector('.fml-floating-close').addEventListener('pointerdown', event => event.stopPropagation());
-    button.querySelector('.fml-floating-close').addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
-        hideFloatingButtonFromControl();
-    });
+        <button class="fml-floating-control fml-floating-close" type="button" title="关闭悬浮球" aria-label="关闭悬浮球"><i class="fa-solid fa-xmark"></i></button>
+        <button class="fml-floating-control fml-floating-resniff" type="button" title="重新嗅探当前场景" aria-label="重新嗅探当前场景"><i class="fa-solid fa-rotate"></i></button>
+        <button class="fml-floating-control fml-floating-records" type="button" title="查看本次嗅探记录" aria-label="查看本次嗅探记录"><i class="fa-solid fa-list-ul"></i></button>`;
+    const bindControl = (selector, action) => {
+        const control = button.querySelector(selector);
+        for (const eventName of ['pointerdown', 'mousedown', 'touchstart']) {
+            control.addEventListener(eventName, event => event.stopPropagation(), { passive: eventName === 'touchstart' });
+        }
+        control.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            action();
+        });
+    };
+    bindControl('.fml-floating-close', hideFloatingButtonFromControl);
+    bindControl('.fml-floating-resniff', manualResniffCurrentScene);
+    bindControl('.fml-floating-records', openSniffRecordsModal);
     button.addEventListener('keydown', event => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
         event.preventDefault();
@@ -2271,15 +2748,15 @@ function injectSettingsPanel() {
                     <label class="fml-check-row"><span>启用资源嗅探</span><input id="fml-sniff-enabled" type="checkbox" ${settings.sniffingEnabled ? 'checked' : ''}></label>
                     <label class="fml-check-row"><span>接收嗅探通知</span><input id="fml-sniff-notifications" type="checkbox" ${settings.sniffNotifications ? 'checked' : ''}></label>
                     <label class="fml-check-row"><span>自动下载嗅探资源</span><input id="fml-sniff-auto" type="checkbox" ${settings.sniffAutoDownload ? 'checked' : ''} ${settings.offlineMode ? 'disabled' : ''}></label>
-                    <label class="fml-check-row"><span>失败后允许另存为</span><input id="fml-sniff-save-as" type="checkbox" ${settings.sniffSaveAs ? 'checked' : ''}></label>
+                    <label class="fml-check-row"><span>失败后启用补偿保存</span><input id="fml-sniff-save-as" type="checkbox" ${settings.sniffSaveAs ? 'checked' : ''}></label>
                     <label class="fml-number-row"><span>最多同时显示</span><span><input id="fml-sniff-max" class="text_pole" type="number" min="1" max="20" step="1" value="${escapeHtml(settings.sniffMaxNotifications)}"> 条</span></label>
                     <label class="fml-number-row"><span>通知显示时间</span><span><input id="fml-sniff-seconds" class="text_pole" type="number" min="1" max="300" step="1" value="${escapeHtml(settings.sniffNotificationSeconds)}"> 秒</span></label>
                     <div id="fml-handle-status" class="fml-current-summary">尚未选择资源目录（推荐选择 data/resources）</div>
                     <div class="fml-settings-actions">
-                        <button id="fml-choose-resource-folder" class="menu_button"><i class="fa-solid fa-folder-open"></i> 授权资源目录</button>
+                        <button id="fml-choose-resource-folder" class="menu_button"><i class="fa-solid fa-folder-open"></i> 授权备用目录（可选）</button>
                         <button id="fml-clear-sniff-blocks" class="menu_button"><i class="fa-solid fa-bell"></i> 清除不再通知列表</button>
                     </div>
-                    <small>普通下载和自动下载由酒馆服务器直接保存到 data/resources/角色卡/类型。直接下载失败且启用另存为后，手动再次点击会优先读取浏览器已加载的资源并写入已授权目录，同时登记本地映射；只有跨域等限制导致浏览器无法读取时，才会询问是否改用默认下载并手动导入。</small>
+                    <small>备用目录授权用于下载失败时，让浏览器把已读取的资源直接写入酒馆。首次使用请点击“授权备用目录”，在浏览器窗口选择 <code>SillyTavern/data/resources</code> 并允许读写，通常只需授权一次。此项可选；不授权会自动改用普通下载。</small>
                 </div>
                 <div class="fml-settings-module">
                     <div class="fml-module-title">网站请求速率</div>
@@ -2374,7 +2851,6 @@ function injectSettingsPanel() {
     panel.querySelector('#fml-sniff-enabled').addEventListener('change', event => {
         settings.sniffingEnabled = event.target.checked;
         saveSettings();
-        sniffSeen = new Set();
         if (!settings.sniffingEnabled) clearSniffNotifications();
         else if (settings.enabled) document.querySelectorAll('iframe').forEach(iframe => scanLoadedMedia(iframe.contentDocument));
     });
@@ -2384,7 +2860,7 @@ function injectSettingsPanel() {
         if (!settings.sniffNotifications) clearSniffNotifications();
         else if (settings.enabled && settings.sniffingEnabled) {
             for (const record of sniffRecords.values()) {
-                if (record.state !== 'saved') showSniffNotification(record);
+                if (record.cardName === currentCard?.name && record.state !== 'saved') showSniffNotification(record);
             }
         }
     });
@@ -2411,7 +2887,7 @@ function injectSettingsPanel() {
         saveSettings();
     });
     panel.querySelector('#fml-choose-resource-folder').addEventListener('click', async () => {
-        try { await chooseResourceDirectory(); toastr.success('资源目录授权成功', '资源嗅探'); }
+        try { await authorizeResourceDirectory(); toastr.success('resources 目录授权成功', '资源嗅探'); }
         catch (error) { if (error?.name !== 'AbortError') toastr.error(error.message || String(error), '资源嗅探'); }
     });
     panel.querySelector('#fml-clear-sniff-blocks').addEventListener('click', () => {
@@ -2483,7 +2959,7 @@ function closeModal() {
 function renderCandidateRow(item) {
     const type = MEDIA_TYPES.includes(item.type) ? item.type : 'unknown';
     const host = (() => { try { return new URL(item.url).hostname; } catch { return ''; } })();
-    const status = item.downloaded ? '已下载' : item.error ? item.error : item.status === 'probing' ? '正在估算……' : item.status === 'downloading' ? '正在下载……' : item.status === 'done' ? '已完成' : formatBytes(item.size);
+    const status = item.statusLabel || (item.downloaded ? '已下载' : item.error ? item.error : item.status === 'probing' ? '正在估算……' : item.status === 'downloading' ? '正在下载……' : item.status === 'done' ? '已完成' : formatBytes(item.size));
     return `
         <label class="fml-resource-row ${item.downloaded ? 'is-downloaded' : ''}" data-url="${escapeHtml(item.url)}" data-type="${type}">
             <input class="fml-resource-check" type="checkbox" ${item.selected && MEDIA_TYPES.includes(item.type) && !item.downloaded ? 'checked' : ''} ${!MEDIA_TYPES.includes(item.type) || item.downloaded ? 'disabled' : ''}>
@@ -2506,6 +2982,78 @@ function scanModalBody(items, pendingCount) {
             <button class="menu_button fml-cancel">取消</button>
             <button id="fml-download-selected" class="menu_button fml-primary" disabled><i class="fa-solid fa-download"></i> 下载所选资源</button>
         </footer>`;
+}
+
+function sniffRecordsModalBody(items, pendingCount) {
+    return `
+        <div class="fml-scan-summary"><strong>待处理 <span id="fml-pending-count">${pendingCount}</span> 个，共记录 ${items.length} 个实际出现资源</strong><span id="fml-estimated-total">打开列表不会访问在线图床</span></div>
+        <div class="fml-type-selectors">
+            ${MEDIA_TYPES.map(type => `<label><input class="fml-type-toggle" type="checkbox" data-type="${type}" checked><i class="fa-solid ${TYPE_ICONS[type]}"></i> ${TYPE_LABELS[type]} <span data-count-for="${type}">0</span></label>`).join('')}
+            <label class="fml-show-all-toggle"><input id="fml-only-pending-resources" type="checkbox" ${pendingCount ? 'checked' : ''}><i class="fa-solid fa-filter"></i> 仅显示未下载/失败</label>
+        </div>
+        <div class="fml-resource-list">${items.map(renderCandidateRow).join('')}</div>
+        <footer class="fml-modal-footer">
+            <span id="fml-selection-summary">已选择 0 / ${pendingCount}</span>
+            <button class="menu_button fml-cancel">关闭</button>
+            <button id="fml-download-selected" class="menu_button fml-primary" disabled><i class="fa-solid fa-download"></i> 下载所选资源</button>
+        </footer>`;
+}
+
+function openSniffRecordsModal() {
+    if (!currentCard) return toastr.info('当前没有角色卡资源记录', '资源嗅探');
+    const known = new Map(currentLibrary.filter(item => item.exists).map(item => [item.source, item]));
+    const items = currentCardSniffRecords().map(record => {
+        const localResource = known.get(record.source);
+        const savedPendingRegistration = record.state === 'saved' && !serverAvailable;
+        const localMissing = Boolean(record.localMissing && !localResource && serverAvailable);
+        const downloaded = Boolean(localResource || savedPendingRegistration);
+        let statusLabel = '待下载';
+        if (localResource) statusLabel = '已下载到本地';
+        else if (savedPendingRegistration) statusLabel = '已写入授权目录，等待服务端登记';
+        else if (record.state === 'saving') statusLabel = '正在保存……';
+        else if (record.state === 'awaiting-import') statusLabel = '等待导入浏览器下载文件';
+        else if (record.state === 'failed') statusLabel = record.error || '下载失败';
+        else if (localMissing) statusLabel = '本地文件或映射缺失';
+        return {
+            url: record.source,
+            type: record.type,
+            hint: record.type,
+            size: Number(localResource?.size || record.saved?.size) || null,
+            contentType: localResource?.contentType || record.saved?.contentType || null,
+            error: record.state === 'failed' || localMissing ? statusLabel : null,
+            selected: !downloaded && record.state !== 'saving',
+            downloaded,
+            status: record.state === 'saving' ? 'downloading' : record.state === 'failed' || localMissing ? 'error' : downloaded ? 'downloaded' : 'detected',
+            statusLabel,
+            sniffRecordId: record.id,
+            lastSeenAt: record.lastSeenAt || record.createdAt,
+        };
+    });
+    const pendingCount = items.filter(item => !item.downloaded).length;
+    const modal = createModal(`${currentCard.name} · 本次嗅探记录`, sniffRecordsModalBody(items, pendingCount), 'fml-scan-modal fml-sniff-records-modal');
+    modal.dataset.cardName = currentCard.name;
+    modal.dataset.showAll = String(pendingCount === 0);
+    modal.dataset.noProbe = 'true';
+    modal.querySelector('.fml-cancel').addEventListener('click', closeModal);
+    modal.querySelector('#fml-only-pending-resources').addEventListener('change', event => {
+        modal.dataset.showAll = String(!event.target.checked);
+        refreshScanModal(modal, items);
+    });
+    modal.querySelectorAll('.fml-type-toggle').forEach(toggle => {
+        toggle.addEventListener('change', () => {
+            items.filter(item => !item.downloaded && item.type === toggle.dataset.type).forEach(item => item.selected = toggle.checked);
+            refreshScanModal(modal, items);
+        });
+    });
+    modal.querySelector('.fml-resource-list').addEventListener('change', event => {
+        if (!event.target.classList.contains('fml-resource-check')) return;
+        const row = event.target.closest('.fml-resource-row');
+        const item = items.find(candidate => candidate.url === row?.dataset.url);
+        if (item) item.selected = event.target.checked;
+        updateScanSummary(modal, items);
+    });
+    modal.querySelector('#fml-download-selected').addEventListener('click', () => downloadSelected(modal, items));
+    refreshScanModal(modal, items);
 }
 
 async function openScanModal() {
@@ -2555,10 +3103,11 @@ function refreshScanModal(modal, items) {
     const list = modal.querySelector('.fml-resource-list');
     if (!list) return;
     const showAll = modal.dataset.showAll === 'true';
-    list.innerHTML = items
+    const rows = items
         .filter(item => (showAll || !item.downloaded) && (MEDIA_TYPES.includes(item.type) || item.status === 'probing'))
         .map(renderCandidateRow)
         .join('');
+    list.innerHTML = rows || '<div class="fml-inline-empty">当前筛选条件下没有资源记录。</div>';
     updateScanSummary(modal, items);
 }
 
@@ -2581,9 +3130,12 @@ function updateScanSummary(modal, items) {
     const unknown = selected.filter(item => !Number.isFinite(item.size)).length;
     const total = modal.querySelector('#fml-estimated-total');
     if (total) {
-        const probing = items.some(item => item.status === 'probing');
-        if (unknown && knownSize === 0) total.textContent = `${probing ? '正在估算' : '大小未知'}（${unknown} 个）`;
-        else total.textContent = `预计 ${formatBytes(knownSize)}${unknown ? `，${unknown} 个大小未知` : ''}${probing ? '，仍在估算' : ''}`;
+        if (modal.dataset.noProbe === 'true') total.textContent = `本次运行已记录 ${items.length} 个资源；打开列表不会访问在线图床`;
+        else {
+            const probing = items.some(item => item.status === 'probing');
+            if (unknown && knownSize === 0) total.textContent = `${probing ? '正在估算' : '大小未知'}（${unknown} 个）`;
+            else total.textContent = `预计 ${formatBytes(knownSize)}${unknown ? `，${unknown} 个大小未知` : ''}${probing ? '，仍在估算' : ''}`;
+        }
     }
     const summary = modal.querySelector('#fml-selection-summary');
     if (summary) summary.textContent = `已选择 ${selected.length} / ${mediaItems.length}`;
@@ -2638,6 +3190,13 @@ async function downloadSelected(modal, items) {
     if (!selected.length) return;
     const button = modal.querySelector('#fml-download-selected');
     button.disabled = true;
+    if (!serverAvailable) {
+        await checkServer();
+        if (!serverAvailable) {
+            button.disabled = false;
+            return toastr.error('服务端插件未连接，无法直接下载到酒馆资源目录', '资源本地化');
+        }
+    }
     const cardName = modal.dataset.cardName || currentCard?.name;
     if (!cardName) return;
     if (downloadQueue.some(task => task.cardName === cardName)) return toastr.info('当前角色卡已在下载队列中', '资源本地化');
@@ -2705,13 +3264,22 @@ async function runDownloadTask(task) {
                     task.completed++;
                     await activateDownloadedResource(cardName, result.resource);
                 }
-                else { item.status = 'error'; item.error = result.error; item.selected = false; task.failed++; }
+                else {
+                    item.status = 'error';
+                    item.error = result.error;
+                    item.statusLabel = result.error || '下载失败';
+                    item.selected = false;
+                    markSniffRecordFailed(cardName, item.url, item.error);
+                    task.failed++;
+                }
             }
         } catch (error) {
             batch.forEach(item => {
                 item.status = 'error';
                 item.error = error.message;
+                item.statusLabel = error.message || '下载失败';
                 item.selected = false;
+                markSniffRecordFailed(cardName, item.url, item.error);
                 task.failed++;
             });
         }

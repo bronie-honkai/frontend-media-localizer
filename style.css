@@ -198,10 +198,8 @@
     transition: none;
 }
 
-.fml-floating-close {
+.fml-floating-control {
     position: absolute;
-    top: -8px;
-    left: -8px;
     z-index: 4;
     display: flex;
     width: 20px;
@@ -223,14 +221,20 @@
     transition: opacity .14s ease, transform .14s ease, background .14s ease;
 }
 
-.fml-floating-button:hover .fml-floating-close,
-.fml-floating-button:focus-within .fml-floating-close {
+.fml-floating-close { top: -8px; left: -8px; }
+.fml-floating-resniff { bottom: -8px; left: -8px; }
+.fml-floating-records { right: -8px; bottom: -8px; }
+
+.fml-floating-button:hover .fml-floating-control,
+.fml-floating-button:focus-within .fml-floating-control {
     opacity: 1;
     pointer-events: auto;
     transform: scale(1);
 }
 
 .fml-floating-close:hover { background: #b74343; }
+.fml-floating-resniff:hover { background: #3877a8; }
+.fml-floating-records:hover { background: #486f4d; }
 
 .fml-floating-button.is-downloading {
     background: conic-gradient(var(--fml-queue-color) 0deg var(--fml-progress), rgba(255, 255, 255, .14) var(--fml-progress) 360deg);
@@ -341,6 +345,16 @@
     backdrop-filter: blur(10px);
     pointer-events: auto;
     transform-origin: right bottom;
+    transition: transform .16s ease, filter .16s ease, box-shadow .16s ease, border-color .16s ease;
+}
+
+.fml-sniff-notification:hover,
+.fml-sniff-notification:focus-within {
+    z-index: 2;
+    border-color: var(--fml-sniff-color);
+    filter: brightness(1.08);
+    transform: translateX(-4px);
+    box-shadow: 0 11px 30px var(--black70a), 0 0 0 1px color-mix(in srgb, var(--fml-sniff-color) 45%, transparent);
 }
 
 .fml-offline-notification {
@@ -678,7 +692,7 @@
         height: 52px;
         touch-action: none;
     }
-    .fml-floating-close {
+    .fml-floating-control {
         width: 22px;
         height: 22px;
         opacity: 1;
