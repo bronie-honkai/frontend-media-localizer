@@ -12,9 +12,11 @@ import { extension_settings } from '../../../extensions.js';
 const EXTENSION_KEY = 'frontendMediaLocalizer';
 const API_BASE = '/api/plugins/frontend-media-localizer';
 const EXTENSION_PUBLIC_PATH = '/scripts/extensions/third-party/frontend-media-localizer';
+const OFFLINE_PLACEHOLDER_PATH = `${EXTENSION_PUBLIC_PATH}/offline-placeholder.svg`;
+const OFFLINE_BLOCKED_PATH = `${EXTENSION_PUBLIC_PATH}/offline-blocked`;
 const BACKEND_PLUGIN_FOLDER = 'frontend-media-localizer';
 const BACKEND_TEMPLATE_FILES = ['index.mjs', 'package.json'];
-const REQUIRED_BACKEND_VERSION = '1.2.0';
+const REQUIRED_BACKEND_VERSION = '1.5.0';
 const MEDIA_TYPES = ['image', 'audio', 'video'];
 const TYPE_LABELS = { image: '图片', audio: '音频', video: '视频' };
 const TYPE_ICONS = { image: 'fa-image', audio: 'fa-music', video: 'fa-film' };
@@ -23,14 +25,32 @@ const URL_PATTERN = /https?:\/\/[^\s<>"'`\\]+/gi;
 
 const defaults = {
     enabled: true,
+    useLocalResources: true,
+    offlineMode: false,
     showFloatingButton: true,
+    sniffingEnabled: false,
+    sniffNotifications: true,
+    sniffAutoDownload: false,
+    sniffSaveAs: false,
+    sniffMaxNotifications: 3,
+    sniffNotificationSeconds: 5,
+    sniffBlockedUrls: [],
+    pendingSniffRegistrations: [],
+    floatingPositions: { desktop: null, mobile: null },
+    defaultRequestIntervalSeconds: 1,
+    siteRateRules: [
+        { domain: 'files.catbox.moe', intervalSeconds: 5 },
+    ],
 };
 
 let currentCard = null;
+let currentStorageCardName = null;
 let currentCandidates = new Map();
 let currentLibrary = [];
 let routeMap = new Map();
 let routeRegex = null;
+let reverseRouteMap = new Map();
+let reverseRouteRegex = null;
 let serverAvailable = false;
 let activeModal = null;
 let cardChangeSequence = 0;
@@ -39,22 +59,161 @@ let queueRunnerActive = false;
 let queueDisplayIndex = 0;
 let allCardsRefreshPromise = null;
 let allCardsPollTimer = null;
+let serverHealthTimer = null;
+let serverHealthPromise = null;
+let currentLibraryPollTimer = null;
+let currentLibraryRefreshPromise = null;
+let libraryMutationSequence = 0;
+let offlineFallbackApplied = false;
 let backendInstallPrompted = false;
 let backendUpdateRequired = false;
 let detectedBackendVersion = null;
+let latestLoadedResource = null;
+let sniffSeen = new Set();
+let sniffRecords = new Map();
+let sniffAutoQueue = [];
+let sniffAutoRunnerActive = false;
+let resourceDirectoryHandle = null;
+let nextSniffRequestAt = new Map();
+let sniffRequestGate = Promise.resolve();
+let floatingViewportMode = null;
+let offlineNoticeTimes = new Map();
+const trackedMediaElements = new Set();
+
+const HANDLE_DB_NAME = 'frontend-media-localizer';
+const HANDLE_STORE_NAME = 'handles';
+const RESOURCE_HANDLE_KEY = 'resources-root';
+
+function openHandleDatabase() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(HANDLE_DB_NAME, 1);
+        request.onupgradeneeded = () => {
+            if (!request.result.objectStoreNames.contains(HANDLE_STORE_NAME)) request.result.createObjectStore(HANDLE_STORE_NAME);
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function readStoredHandle() {
+    const database = await openHandleDatabase();
+    try {
+        return await new Promise((resolve, reject) => {
+            const request = database.transaction(HANDLE_STORE_NAME, 'readonly').objectStore(HANDLE_STORE_NAME).get(RESOURCE_HANDLE_KEY);
+            request.onsuccess = () => resolve(request.result || null);
+            request.onerror = () => reject(request.error);
+        });
+    } finally { database.close(); }
+}
+
+async function storeResourceHandle(handle) {
+    const database = await openHandleDatabase();
+    try {
+        await new Promise((resolve, reject) => {
+            const request = database.transaction(HANDLE_STORE_NAME, 'readwrite').objectStore(HANDLE_STORE_NAME).put(handle, RESOURCE_HANDLE_KEY);
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    } finally { database.close(); }
+}
+
+async function handlePermission(handle, request = false) {
+    if (!handle) return false;
+    const options = { mode: 'readwrite' };
+    if (await handle.queryPermission(options) === 'granted') return true;
+    return request && await handle.requestPermission(options) === 'granted';
+}
 
 function getSettings() {
     if (!extension_settings[EXTENSION_KEY] || typeof extension_settings[EXTENSION_KEY] !== 'object') {
         extension_settings[EXTENSION_KEY] = structuredClone(defaults);
     }
     for (const [key, value] of Object.entries(defaults)) {
-        if (extension_settings[EXTENSION_KEY][key] === undefined) extension_settings[EXTENSION_KEY][key] = value;
+        if (extension_settings[EXTENSION_KEY][key] === undefined) extension_settings[EXTENSION_KEY][key] = structuredClone(value);
     }
     return extension_settings[EXTENSION_KEY];
 }
 
 function saveSettings() {
     saveSettingsDebounced();
+}
+
+function isMobileLayout() {
+    const hasTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+    return window.matchMedia('(max-width: 767px)').matches || (hasTouch && window.innerWidth < 900);
+}
+
+function normalizeRateSeconds(value, fallback = 1) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.min(3600, Math.max(0.1, parsed)) : fallback;
+}
+
+function normalizeRateDomain(value) {
+    let domain = String(value ?? '').trim().toLowerCase();
+    try {
+        if (domain.includes('://')) domain = new URL(domain).hostname.toLowerCase();
+    } catch { return ''; }
+    domain = domain.replace(/^\.+|\.+$/g, '');
+    return /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(domain) ? domain : '';
+}
+
+function getRatePolicy() {
+    const settings = getSettings();
+    const rules = [];
+    const seen = new Set();
+    for (const item of Array.isArray(settings.siteRateRules) ? settings.siteRateRules : []) {
+        const domain = normalizeRateDomain(item?.domain);
+        if (!domain || seen.has(domain)) continue;
+        seen.add(domain);
+        rules.push({ domain, intervalMs: Math.round(normalizeRateSeconds(item?.intervalSeconds, 1) * 1000) });
+    }
+    return {
+        defaultIntervalMs: Math.round(normalizeRateSeconds(settings.defaultRequestIntervalSeconds, 1) * 1000),
+        rules,
+    };
+}
+
+async function waitForSniffRequestSlot(url) {
+    const policy = getRatePolicy();
+    const hostname = new URL(url).hostname.toLowerCase();
+    const rule = [...policy.rules].sort((left, right) => right.domain.length - left.domain.length)
+        .find(item => hostname === item.domain || hostname.endsWith(`.${item.domain}`));
+    const key = rule?.domain || hostname;
+    const intervalMs = rule?.intervalMs ?? policy.defaultIntervalMs;
+    const turn = sniffRequestGate.then(async () => {
+        const delay = Math.max(0, (nextSniffRequestAt.get(key) || 0) - Date.now());
+        if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+        nextSniffRequestAt.set(key, Date.now() + intervalMs);
+    });
+    sniffRequestGate = turn.catch(() => {});
+    await turn;
+}
+
+function renderRateRuleRows(container, settings) {
+    const rules = Array.isArray(settings.siteRateRules) ? settings.siteRateRules : [];
+    container.innerHTML = rules.length ? rules.map((rule, index) => `
+        <div class="fml-rate-rule" data-index="${index}">
+            <input class="text_pole fml-rate-domain" type="text" value="${escapeHtml(rule?.domain || '')}" placeholder="files.example.com" aria-label="网站域名">
+            <input class="text_pole fml-rate-seconds" type="number" min="0.1" max="3600" step="0.1" value="${escapeHtml(normalizeRateSeconds(rule?.intervalSeconds, 1))}" aria-label="请求间隔秒数">
+            <span>秒</span>
+            <button class="menu_button fml-rate-remove" type="button" title="删除规则"><i class="fa-solid fa-trash"></i></button>
+        </div>`).join('') : '<small class="fml-rate-empty">暂无单独网站规则，全部使用默认间隔。</small>';
+}
+
+function saveRateRulesFromPanel(panel, settings) {
+    const rules = [];
+    const seen = new Set();
+    for (const row of panel.querySelectorAll('.fml-rate-rule')) {
+        const domain = normalizeRateDomain(row.querySelector('.fml-rate-domain')?.value);
+        if (!domain || seen.has(domain)) continue;
+        seen.add(domain);
+        rules.push({
+            domain,
+            intervalSeconds: normalizeRateSeconds(row.querySelector('.fml-rate-seconds')?.value, 1),
+        });
+    }
+    settings.siteRateRules = rules;
+    saveSettings();
 }
 
 function escapeHtml(value) {
@@ -68,6 +227,51 @@ function escapeHtml(value) {
 
 function escapeRegExp(value) {
     return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function isOfflineMode() {
+    const settings = getSettings();
+    return Boolean(settings.enabled && settings.offlineMode);
+}
+
+function encodeSourceParameter(value) {
+    const bytes = new TextEncoder().encode(String(value));
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function isOfflineResourceUrl(value) {
+    try {
+        const url = new URL(String(value).replaceAll('&amp;', '&'), location.origin);
+        return url.origin === location.origin
+            && (url.pathname === OFFLINE_PLACEHOLDER_PATH || url.pathname.startsWith(`${OFFLINE_BLOCKED_PATH}-`));
+    } catch { return false; }
+}
+
+function offlineResourceUrl(source, type) {
+    const path = type === 'image' ? OFFLINE_PLACEHOLDER_PATH : `${OFFLINE_BLOCKED_PATH}-${type}.bin`;
+    const url = new URL(path, location.origin);
+    url.searchParams.set('source', encodeSourceParameter(source));
+    url.searchParams.set('type', type);
+    return url.href;
+}
+
+function localResourceUrl(localUrl) {
+    try {
+        const url = new URL(localUrl, location.origin);
+        if (isOfflineMode()) url.searchParams.set('offline', '1');
+        return url.href;
+    } catch { return localUrl; }
+}
+
+function currentCardResource(source, typeHint = null) {
+    const normalized = decodeSourceParameter(source) || normalizeCandidate(source);
+    if (!normalized) return null;
+    const candidate = currentCandidates.get(normalized);
+    if (!candidate) return null;
+    const type = typeHint || candidate.type || inferType(normalized);
+    return MEDIA_TYPES.includes(type) ? { source: normalized, type, candidate } : null;
 }
 
 function formatBytes(value) {
@@ -86,7 +290,8 @@ function normalizeCandidate(raw) {
     try {
         const url = new URL(value);
         if (!['http:', 'https:'].includes(url.protocol)) return null;
-        if (url.origin === location.origin && url.pathname.startsWith(API_BASE)) return null;
+        if (url.origin === location.origin
+            && (url.pathname.startsWith(API_BASE) || url.pathname === OFFLINE_PLACEHOLDER_PATH || url.pathname.startsWith(`${OFFLINE_BLOCKED_PATH}-`))) return null;
         return url.href;
     } catch {
         return null;
@@ -177,12 +382,20 @@ function isVersionAtLeast(actual, required) {
 }
 
 async function checkServer() {
+    if (serverHealthPromise) return serverHealthPromise;
+    serverHealthPromise = checkServerOnce().finally(() => { serverHealthPromise = null; });
+    return serverHealthPromise;
+}
+
+async function checkServerOnce() {
+    const wasAvailable = serverAvailable;
     try {
-        const status = await api('/status', { method: 'GET', headers: {} });
+        const status = await api('/status', { method: 'GET', headers: {}, signal: AbortSignal.timeout(4000) });
         detectedBackendVersion = status.version || null;
         backendUpdateRequired = Boolean(status.enabled && status.writable && !isVersionAtLeast(detectedBackendVersion, REQUIRED_BACKEND_VERSION));
         serverAvailable = Boolean(status.enabled && status.writable && !backendUpdateRequired);
         updateSettingsStatus({ ...status, updateRequired: backendUpdateRequired });
+        await handleServerAvailabilityChange(wasAvailable, serverAvailable);
         refreshAllCardsInline();
         return status;
     } catch (error) {
@@ -190,7 +403,41 @@ async function checkServer() {
         backendUpdateRequired = false;
         detectedBackendVersion = null;
         updateSettingsStatus({ enabled: false, error: error.message });
+        await handleServerAvailabilityChange(wasAvailable, false);
         return null;
+    }
+}
+
+async function handleServerAvailabilityChange(wasAvailable, isAvailable) {
+    if (!isAvailable) {
+        if (offlineFallbackApplied) return;
+        offlineFallbackApplied = true;
+        currentLibrary = [];
+        setRouteMap([]);
+        if (isOfflineMode()) {
+            applyCurrentResourcePolicy();
+        } else {
+            restoreAllLocalizedContent();
+            await rerenderFrontendFrames();
+            restoreAllLocalizedContent();
+        }
+        updateFloatingButton();
+        updateSettingsSummary();
+        return;
+    }
+    offlineFallbackApplied = false;
+    if (wasAvailable === isAvailable) return;
+    await syncPendingRegistrations().catch(error => console.debug('[FrontendMediaLocalizer] Pending registration sync failed:', error));
+    if (!currentCard || !getSettings().enabled || !getSettings().useLocalResources) return;
+    try {
+        await loadLibrary(currentCard.name);
+        if (isOfflineMode()) applyCurrentResourcePolicy();
+        else {
+            rewriteAllMessages();
+            await rerenderFrontendFrames();
+        }
+    } catch (error) {
+        console.debug('[FrontendMediaLocalizer] Failed to restore local routes after reconnect:', error);
     }
 }
 
@@ -328,15 +575,48 @@ async function loadLibrary(cardName = currentCard?.name) {
         return [];
     }
     const data = await api(`/library?card=${encodeURIComponent(cardName)}`, { method: 'GET', headers: {} });
+    if (currentCard?.name === cardName) currentStorageCardName = data.card || cardName;
     currentLibrary = Array.isArray(data.resources) ? data.resources : [];
+    libraryMutationSequence++;
     setRouteMap(currentLibrary);
     updateFloatingButton();
     updateSettingsSummary();
     return currentLibrary;
 }
 
+async function refreshCurrentLibrarySilently() {
+    if (!serverAvailable || !currentCard || document.hidden || downloadQueue.length || queueRunnerActive || sniffAutoRunnerActive) return;
+    if ([...sniffRecords.values()].some(record => record.state === 'saving')) return;
+    if (currentLibraryRefreshPromise) return currentLibraryRefreshPromise;
+    const cardName = currentCard.name;
+    const mutationSequence = libraryMutationSequence;
+    currentLibraryRefreshPromise = (async () => {
+        try {
+            const data = await api(`/library?card=${encodeURIComponent(cardName)}`, { method: 'GET', headers: {} });
+            if (currentCard?.name !== cardName || mutationSequence !== libraryMutationSequence) return;
+            currentLibrary = Array.isArray(data.resources) ? data.resources : [];
+            currentStorageCardName = data.card || cardName;
+            libraryMutationSequence++;
+            setRouteMap(currentLibrary);
+            updateFloatingButton();
+            updateSettingsSummary();
+            if (Number(data.repaired) > 0) {
+                console.info('[FrontendMediaLocalizer] 已静默修复手动删除的本地资源映射', {
+                    角色卡: cardName,
+                    修复数量: Number(data.repaired),
+                });
+            }
+        } catch (error) {
+            console.debug('[FrontendMediaLocalizer] 当前卡资源静默复检失败:', error);
+        }
+    })().finally(() => { currentLibraryRefreshPromise = null; });
+    return currentLibraryRefreshPromise;
+}
+
 function setRouteMap(resources) {
-    routeMap = new Map(resources.filter(item => item.source && item.localUrl).map(item => [item.source, item.localUrl]));
+    const available = resources.filter(item => item.source && item.localUrl && item.exists !== false);
+    routeMap = new Map(available.map(item => [item.source, item.localUrl]));
+    reverseRouteMap = new Map(available.map(item => [item.localUrl, item.source]));
     for (const candidate of currentCandidates.values()) {
         const localUrl = routeMap.get(candidate.url);
         if (!localUrl) continue;
@@ -348,16 +628,566 @@ function setRouteMap(resources) {
     } else {
         routeRegex = null;
     }
+    if (reverseRouteMap.size) {
+        const alternatives = [...reverseRouteMap.keys()].sort((a, b) => b.length - a.length).map(escapeRegExp);
+        reverseRouteRegex = new RegExp(alternatives.join('|'), 'g');
+    } else {
+        reverseRouteRegex = null;
+    }
+}
+
+function rememberMediaElement(element) {
+    const tag = String(element?.tagName || '').toLowerCase();
+    if (!['audio', 'video'].includes(tag)) return;
+    trackedMediaElements.add(element);
+    if (trackedMediaElements.size <= 256) return;
+    for (const candidate of trackedMediaElements) {
+        if (candidate === element) continue;
+        if (candidate?.ended || (candidate?.paused && !candidate?.isConnected)) trackedMediaElements.delete(candidate);
+        if (trackedMediaElements.size <= 192) break;
+    }
+    while (trackedMediaElements.size > 256) trackedMediaElements.delete(trackedMediaElements.values().next().value);
+}
+
+function valueSourceMatches(value, source) {
+    if (!value || !source) return false;
+    const stringValue = String(value).replaceAll('&amp;', '&');
+    return stringValue === source
+        || decodeSourceParameter(stringValue) === source
+        || reverseRouteMap.get(stringValue) === source
+        || normalizeCandidate(stringValue) === source;
+}
+
+function captureMediaPlaybackState(media) {
+    return {
+        currentTime: Number.isFinite(media.currentTime) ? media.currentTime : 0,
+        shouldResume: !media.paused && !media.ended,
+        volume: media.volume,
+        muted: media.muted,
+        playbackRate: media.playbackRate,
+        loop: media.loop,
+    };
+}
+
+function restoreMediaPlaybackState(media, state) {
+    const restore = () => {
+        try {
+            media.volume = state.volume;
+            media.muted = state.muted;
+            media.playbackRate = state.playbackRate;
+            media.loop = state.loop;
+            if (state.currentTime > 0 && Number.isFinite(state.currentTime)) {
+                const maximum = Number.isFinite(media.duration) && media.duration > 0 ? Math.max(0, media.duration - 0.05) : state.currentTime;
+                media.currentTime = Math.min(state.currentTime, maximum);
+            }
+        } catch (error) {
+            console.debug('[FrontendMediaLocalizer] 恢复媒体播放状态失败:', error);
+        }
+        if (state.shouldResume) void media.play().catch(error => console.debug('[FrontendMediaLocalizer] 本地媒体自动续播失败:', error));
+    };
+    if (media.readyState >= 1) queueMicrotask(restore);
+    else media.addEventListener('loadedmetadata', restore, { once: true });
+}
+
+function hotSwapMediaElement(media, source, localUrl) {
+    if (!media || media.dataset?.fmlHotSwapping === 'true') return false;
+    const directMatch = valueSourceMatches(media.getAttribute('src'), source) || valueSourceMatches(media.currentSrc, source);
+    const matchingSources = [...(media.querySelectorAll?.('source[src]') || [])].filter(element => valueSourceMatches(element.getAttribute('src'), source));
+    if (!directMatch && !matchingSources.length) return false;
+
+    const state = captureMediaPlaybackState(media);
+    if (media.dataset) media.dataset.fmlHotSwapping = 'true';
+    try {
+        if (directMatch) setMediaAttributeWithoutRouting(media, 'src', localUrl);
+        matchingSources.forEach(element => setMediaAttributeWithoutRouting(element, 'src', localUrl));
+        media.load();
+        restoreMediaPlaybackState(media, state);
+        rememberMediaElement(media);
+        return true;
+    } finally {
+        if (media.dataset) delete media.dataset.fmlHotSwapping;
+    }
+}
+
+function accessibleDocuments(root = document, output = new Set()) {
+    if (!root || output.has(root)) return output;
+    output.add(root);
+    root.querySelectorAll?.('iframe').forEach(iframe => {
+        try {
+            if (iframe.contentDocument) accessibleDocuments(iframe.contentDocument, output);
+        } catch { /* cross-origin iframe */ }
+    });
+    return output;
+}
+
+function hotSwapDocumentResource(documentRef, source, localUrl, processedMedia) {
+    if (!documentRef) return 0;
+    if (documentRef !== document) bindDocumentMediaFallback(documentRef);
+    let switched = 0;
+
+    documentRef.querySelectorAll('audio, video').forEach(media => {
+        processedMedia.add(media);
+        if (hotSwapMediaElement(media, source, localUrl)) switched++;
+    });
+    documentRef.querySelectorAll('img[src], input[type="image"][src]').forEach(element => {
+        if (!valueSourceMatches(element.getAttribute('src'), source)) return;
+        setMediaAttributeWithoutRouting(element, 'src', localUrl);
+        switched++;
+    });
+    documentRef.querySelectorAll('source[src]').forEach(element => {
+        if (['audio', 'video'].includes(String(element.parentElement?.tagName || '').toLowerCase())) return;
+        if (!valueSourceMatches(element.getAttribute('src'), source)) return;
+        setMediaAttributeWithoutRouting(element, 'src', localUrl);
+        switched++;
+    });
+    documentRef.querySelectorAll('video[poster]').forEach(element => {
+        if (!valueSourceMatches(element.getAttribute('poster'), source)) return;
+        setMediaAttributeWithoutRouting(element, 'poster', localUrl);
+        switched++;
+    });
+    documentRef.querySelectorAll('[srcset]').forEach(element => {
+        const value = element.getAttribute('srcset') || '';
+        const replacement = rewriteText(value);
+        if (replacement === value) return;
+        setMediaAttributeWithoutRouting(element, 'srcset', replacement);
+        switched++;
+    });
+    documentRef.querySelectorAll('[style]').forEach(element => {
+        const value = element.getAttribute('style') || '';
+        const replacement = rewriteText(value);
+        if (replacement === value) return;
+        setMediaAttributeWithoutRouting(element, 'style', replacement);
+        switched++;
+    });
+    documentRef.querySelectorAll('style').forEach(element => {
+        const value = element.textContent || '';
+        const replacement = rewriteText(value);
+        if (replacement === value) return;
+        element.textContent = replacement;
+        switched++;
+    });
+    return switched;
+}
+
+async function activateDownloadedResource(cardName, resource) {
+    if (!resource?.source || !resource?.localUrl || currentCard?.name !== cardName) return 0;
+    const normalized = { ...resource, exists: true, status: 'downloaded' };
+    libraryMutationSequence++;
+    const index = currentLibrary.findIndex(item => item.id === normalized.id || item.source === normalized.source);
+    if (index >= 0) currentLibrary[index] = { ...currentLibrary[index], ...normalized };
+    else currentLibrary.push(normalized);
+    setRouteMap(currentLibrary);
+    updateSettingsSummary();
+    updateFloatingButton();
+    if (!shouldUseLocalRoutes()) return 0;
+    const activeLocalUrl = localResourceUrl(normalized.localUrl);
+
+    const processedMedia = new Set();
+    let switched = 0;
+    try {
+        for (const documentRef of accessibleDocuments()) switched += hotSwapDocumentResource(documentRef, normalized.source, activeLocalUrl, processedMedia);
+        for (const media of [...trackedMediaElements]) {
+            if (!media) {
+                trackedMediaElements.delete(media);
+                continue;
+            }
+            if (processedMedia.has(media)) continue;
+            if (hotSwapMediaElement(media, normalized.source, activeLocalUrl)) switched++;
+        }
+        if (switched > 0) {
+            setLatestLoadedResource({ source: normalized.source, actual: activeLocalUrl, type: normalized.type, local: true }, '下载完成后静默热切换');
+        }
+        console.info('[FrontendMediaLocalizer] 本地资源路由已热更新', {
+            原始链接: normalized.source,
+            本地链接: activeLocalUrl,
+            原地切换数量: switched,
+            保留前端卡运行状态: true,
+        });
+    } catch (error) {
+        console.error('[FrontendMediaLocalizer] 资源热切换失败，后续加载仍会使用本地路由:', error);
+    }
+    return switched;
 }
 
 function rewriteText(text) {
-    if (!routeRegex || typeof text !== 'string') return text;
+    if (typeof text !== 'string' || !getSettings().enabled) return text;
+    if (isOfflineMode()) {
+        URL_PATTERN.lastIndex = 0;
+        return text.replace(URL_PATTERN, match => {
+            const raw = match.trim().replace(/[),;\]}]+$/g, '');
+            const suffix = match.slice(raw.length);
+            const info = currentCardResource(raw);
+            if (!info) return match;
+            const localUrl = serverAvailable && getSettings().useLocalResources ? routeMap.get(info.source) : null;
+            return `${localUrl ? localResourceUrl(localUrl) : offlineResourceUrl(info.source, info.type)}${suffix}`;
+        });
+    }
+    if (!serverAvailable || !getSettings().useLocalResources || !routeRegex) return text;
     routeRegex.lastIndex = 0;
-    return text.replace(routeRegex, match => routeMap.get(match) || match);
+    return text.replace(routeRegex, match => {
+        const localUrl = routeMap.get(match);
+        return localUrl ? localResourceUrl(localUrl) : match;
+    });
+}
+
+function shouldUseLocalRoutes() {
+    const settings = getSettings();
+    return Boolean(serverAvailable && settings.enabled && settings.useLocalResources && routeMap.size);
+}
+
+function canonicalManagedResourceRoute(value) {
+    if (typeof value !== 'string' || !value) return null;
+    let decoded = value.replaceAll('&amp;', '&');
+    const markers = [`${API_BASE}/file/`, OFFLINE_PLACEHOLDER_PATH, `${OFFLINE_BLOCKED_PATH}-`];
+    for (let attempt = 0; attempt < 4; attempt++) {
+        for (const marker of markers) {
+            const index = decoded.indexOf(marker);
+            if (index < 0) continue;
+            try {
+                const url = new URL(decoded.slice(index), location.origin);
+                const recognized = url.pathname.startsWith(`${API_BASE}/file/`)
+                    || url.pathname === OFFLINE_PLACEHOLDER_PATH
+                    || url.pathname.startsWith(`${OFFLINE_BLOCKED_PATH}-`);
+                if (recognized) return `${url.pathname}${url.search}${url.hash}`;
+            } catch { return null; }
+        }
+        try {
+            const next = decodeURIComponent(decoded);
+            if (next === decoded) break;
+            decoded = next;
+        } catch { break; }
+    }
+    return null;
+}
+
+function canonicalLocalRoute(value) {
+    const route = canonicalManagedResourceRoute(value);
+    return route?.startsWith(`${API_BASE}/file/`) ? route : null;
+}
+
+function routeForDynamicValue(element, attribute, value, reason = '') {
+    if (typeof value !== 'string' || !value) return value;
+    const documentRef = element?.ownerDocument;
+    const state = documentRef?._fmlRuntimeRouterState;
+    if (state?.bypass.has(element)) return value;
+
+    if (['style', 'cssText', 'innerHTML', 'outerHTML', 'srcset'].includes(attribute)) {
+        observeRuntimeValue(element, attribute, value, reason);
+        if (!shouldUseLocalRoutes() && !isOfflineMode()) return value;
+        return rewriteText(value);
+    }
+
+    if (isOfflineResourceUrl(value)) {
+        const source = decodeSourceParameter(value);
+        let type = runtimeTypeForElement(element, source, reason);
+        try { type = new URL(value, location.origin).searchParams.get('type') || type; } catch { /* keep inferred type */ }
+        if (source && ['audio', 'video'].includes(type)) showOfflineMissingNotice(source, type);
+        return value;
+    }
+
+    const embeddedLocalRoute = canonicalManagedResourceRoute(value);
+    if (embeddedLocalRoute) {
+        const embeddedSource = decodeSourceParameter(embeddedLocalRoute);
+        if (!embeddedSource) return value;
+        const typeHint = attribute === 'poster' ? 'image' : runtimeTypeForElement(element, embeddedSource, reason);
+        observeRuntimeSource(embeddedSource, typeHint, reason, embeddedLocalRoute);
+        const fallback = state?.fallbackSources.get(element)?.get(attribute);
+        const expectedLocalRoute = routeMap.get(embeddedSource);
+        if (isOfflineMode()) {
+            const info = currentCardResource(embeddedSource, typeHint);
+            if (!info) return embeddedSource;
+            if (serverAvailable && getSettings().useLocalResources && expectedLocalRoute) return localResourceUrl(expectedLocalRoute);
+            if (info.type !== 'image') showOfflineMissingNotice(info.source, info.type);
+            return offlineResourceUrl(info.source, info.type);
+        }
+        if (!shouldUseLocalRoutes() || fallback === embeddedSource || !expectedLocalRoute) return embeddedSource;
+        if (value !== expectedLocalRoute) {
+            console.info('[FrontendMediaLocalizer] 已修复前端卡二次拼接的本地路由', {
+                错误地址: value,
+                修复地址: expectedLocalRoute,
+                原始在线地址: embeddedSource,
+                拦截位置: reason || `${element?.tagName || 'element'}.${attribute}`,
+            });
+        }
+        return localResourceUrl(expectedLocalRoute);
+    }
+
+    observeRuntimeValue(element, attribute, value, reason);
+    const source = normalizeCandidate(value);
+    if (!source) return value;
+    const typeHint = attribute === 'poster' ? 'image' : runtimeTypeForElement(element, source, reason);
+    const info = currentCardResource(source, typeHint);
+    const fallback = state?.fallbackSources.get(element)?.get(attribute);
+    if (!isOfflineMode() && fallback === source) return value;
+    if (fallback && fallback !== source) state.fallbackSources.get(element)?.delete(attribute);
+    const localUrl = routeMap.get(value) || routeMap.get(source);
+    if (localUrl && shouldUseLocalRoutes()) {
+        console.info('[FrontendMediaLocalizer] 动态资源映射命中', {
+            类型: info?.type || inferType(source, `${element?.tagName || ''}.${attribute}`),
+            原始链接: source,
+            本地链接: localUrl,
+            拦截位置: reason || `${element?.tagName || 'element'}.${attribute}`,
+        });
+        return localResourceUrl(localUrl);
+    }
+    if (isOfflineMode() && info) {
+        if (info.type !== 'image') showOfflineMissingNotice(info.source, info.type);
+        return offlineResourceUrl(info.source, info.type);
+    }
+    if (!shouldUseLocalRoutes()) return value;
+
+    return value;
+}
+
+function setMediaAttributeWithoutRouting(element, attribute, value, markFallback = false) {
+    const state = element?.ownerDocument?._fmlRuntimeRouterState;
+    if (markFallback && state) {
+        let attributes = state.fallbackSources.get(element);
+        if (!attributes) {
+            attributes = new Map();
+            state.fallbackSources.set(element, attributes);
+        }
+        const source = normalizeCandidate(value);
+        if (source) attributes.set(attribute, source);
+    }
+    state?.bypass.add(element);
+    try {
+        element.setAttribute(attribute, value);
+    } finally {
+        state?.bypass.delete(element);
+    }
+}
+
+function installDocumentRuntimeRouter(documentRef) {
+    if (!documentRef?.defaultView || documentRef === document || documentRef._fmlRuntimeRouterState) return;
+    const windowRef = documentRef.defaultView;
+    const state = {
+        bypass: new WeakSet(),
+        fallbackSources: new WeakMap(),
+        restorers: [],
+    };
+    documentRef._fmlRuntimeRouterState = state;
+
+    const patchProperty = (prototype, property, attribute = property) => {
+        if (!prototype) return;
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+        if (!descriptor?.set || !descriptor.configurable) return;
+        try {
+            Object.defineProperty(prototype, property, {
+                ...descriptor,
+                set(value) {
+                    const routed = routeForDynamicValue(this, attribute, value, `${this.tagName || prototype.constructor?.name}.${property} 赋值`);
+                    return descriptor.set.call(this, routed);
+                },
+            });
+            state.restorers.push(() => Object.defineProperty(prototype, property, descriptor));
+        } catch (error) {
+            console.debug(`[FrontendMediaLocalizer] 无法拦截 ${prototype.constructor?.name}.${property}:`, error);
+        }
+    };
+
+    const originalSetAttribute = windowRef.Element?.prototype?.setAttribute;
+    if (originalSetAttribute) {
+        windowRef.Element.prototype.setAttribute = function (name, value) {
+            const attribute = String(name).toLowerCase();
+            const routable = ['src', 'srcset', 'poster', 'style'].includes(attribute);
+            const routed = routable ? routeForDynamicValue(this, attribute, String(value), `setAttribute(${attribute})`) : value;
+            return originalSetAttribute.call(this, name, routed);
+        };
+        state.restorers.push(() => { windowRef.Element.prototype.setAttribute = originalSetAttribute; });
+    }
+
+    patchProperty(windowRef.HTMLImageElement?.prototype, 'src');
+    patchProperty(windowRef.HTMLImageElement?.prototype, 'srcset');
+    patchProperty(windowRef.HTMLMediaElement?.prototype, 'src');
+    patchProperty(windowRef.HTMLSourceElement?.prototype, 'src');
+    patchProperty(windowRef.HTMLVideoElement?.prototype, 'poster');
+    patchProperty(windowRef.Element?.prototype, 'innerHTML');
+    patchProperty(windowRef.Element?.prototype, 'outerHTML');
+    patchProperty(windowRef.CSSStyleDeclaration?.prototype, 'cssText');
+    patchProperty(windowRef.CSSStyleDeclaration?.prototype, 'background', 'style');
+    patchProperty(windowRef.CSSStyleDeclaration?.prototype, 'backgroundImage', 'style');
+
+    const originalInsertAdjacentHTML = windowRef.Element?.prototype?.insertAdjacentHTML;
+    if (originalInsertAdjacentHTML) {
+        windowRef.Element.prototype.insertAdjacentHTML = function (position, text) {
+            return originalInsertAdjacentHTML.call(this, position, rewriteText(String(text)));
+        };
+        state.restorers.push(() => { windowRef.Element.prototype.insertAdjacentHTML = originalInsertAdjacentHTML; });
+    }
+
+    const originalStyleSetProperty = windowRef.CSSStyleDeclaration?.prototype?.setProperty;
+    if (originalStyleSetProperty) {
+        windowRef.CSSStyleDeclaration.prototype.setProperty = function (property, value, priority) {
+            return originalStyleSetProperty.call(this, property, rewriteText(String(value)), priority);
+        };
+        state.restorers.push(() => { windowRef.CSSStyleDeclaration.prototype.setProperty = originalStyleSetProperty; });
+    }
+
+    const originalFetch = windowRef.fetch;
+    if (typeof originalFetch === 'function') {
+        windowRef.fetch = function (input, init) {
+            const source = typeof input === 'string' || input instanceof windowRef.URL ? String(input) : input?.url;
+            if (!source) return originalFetch.call(this, input, init);
+            const routed = routeForDynamicValue(null, 'src', source, 'iframe fetch()');
+            if (routed === source) return originalFetch.call(this, input, init);
+            const request = input instanceof windowRef.Request ? new windowRef.Request(routed, input) : routed;
+            return originalFetch.call(this, request, init);
+        };
+        state.restorers.push(() => { windowRef.fetch = originalFetch; });
+    }
+
+    const originalXhrOpen = windowRef.XMLHttpRequest?.prototype?.open;
+    if (originalXhrOpen) {
+        windowRef.XMLHttpRequest.prototype.open = function (method, url, ...args) {
+            const source = typeof url === 'string' || url instanceof windowRef.URL ? String(url) : url;
+            const routed = typeof source === 'string' ? routeForDynamicValue(null, 'src', source, 'iframe XMLHttpRequest.open()') : url;
+            return originalXhrOpen.call(this, method, routed, ...args);
+        };
+        state.restorers.push(() => { windowRef.XMLHttpRequest.prototype.open = originalXhrOpen; });
+    }
+
+    const OriginalAudio = windowRef.Audio;
+    if (typeof OriginalAudio === 'function') {
+        const LocalizedAudio = function (source) {
+            const routed = typeof source === 'string' ? routeForDynamicValue(null, 'src', source, 'new Audio(url)') : source;
+            return new OriginalAudio(routed);
+        };
+        LocalizedAudio.prototype = OriginalAudio.prototype;
+        Object.setPrototypeOf(LocalizedAudio, OriginalAudio);
+        windowRef.Audio = LocalizedAudio;
+        state.restorers.push(() => { windowRef.Audio = OriginalAudio; });
+    }
+
+    const originalMediaPlay = windowRef.HTMLMediaElement?.prototype?.play;
+    if (originalMediaPlay) {
+        windowRef.HTMLMediaElement.prototype.play = function (...args) {
+            observeMediaElementActivity(this, 'HTMLMediaElement.play()');
+            return originalMediaPlay.apply(this, args);
+        };
+        state.restorers.push(() => { windowRef.HTMLMediaElement.prototype.play = originalMediaPlay; });
+    }
+
+    const originalMediaLoad = windowRef.HTMLMediaElement?.prototype?.load;
+    if (originalMediaLoad) {
+        windowRef.HTMLMediaElement.prototype.load = function (...args) {
+            observeMediaElementActivity(this, 'HTMLMediaElement.load()');
+            return originalMediaLoad.apply(this, args);
+        };
+        state.restorers.push(() => { windowRef.HTMLMediaElement.prototype.load = originalMediaLoad; });
+    }
+
+    const rewriteElement = element => {
+        if (!element || element.nodeType !== 1) return;
+        for (const attribute of ['src', 'srcset', 'poster', 'style']) {
+            const value = element.getAttribute(attribute);
+            const replacement = routeForDynamicValue(element, attribute, value, `DOM ${attribute} 变化`);
+            if (replacement && replacement !== value) originalSetAttribute.call(element, attribute, replacement);
+        }
+        element.querySelectorAll?.('[src], [srcset], [poster], [style]').forEach(rewriteElement);
+    };
+    const observer = new windowRef.MutationObserver(mutations => {
+        for (const mutation of mutations) {
+            if (mutation.type === 'attributes') rewriteElement(mutation.target);
+            else mutation.addedNodes.forEach(rewriteElement);
+        }
+    });
+    observer.observe(documentRef.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['src', 'srcset', 'poster', 'style'],
+    });
+    state.observer = observer;
+    rewriteElement(documentRef.documentElement);
+    console.debug('[FrontendMediaLocalizer] 已安装 iframe 动态资源本地路由器');
+}
+
+function installTopLevelAudioRouter() {
+    if (window._fmlTopLevelAudioRouterInstalled) return;
+    window._fmlTopLevelAudioRouterInstalled = true;
+
+    const isCardAudioSource = value => {
+        const embeddedRoute = canonicalManagedResourceRoute(value);
+        const source = decodeSourceParameter(embeddedRoute || value) || reverseRouteMap.get(value) || normalizeCandidate(value);
+        return Boolean(source && (currentCandidates.has(source) || routeMap.has(source)));
+    };
+
+    const OriginalAudio = window.Audio;
+    if (typeof OriginalAudio === 'function') {
+        const LocalizedAudio = function (source) {
+            const routed = typeof source === 'string' && isCardAudioSource(source)
+                ? routeForDynamicValue(null, 'src', source, '父页面 new Audio(url)')
+                : source;
+            return new OriginalAudio(routed);
+        };
+        LocalizedAudio.prototype = OriginalAudio.prototype;
+        Object.setPrototypeOf(LocalizedAudio, OriginalAudio);
+        window.Audio = LocalizedAudio;
+    }
+
+    const patchSourceProperty = prototype => {
+        const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, 'src');
+        if (!descriptor?.set || !descriptor.configurable) return;
+        try {
+            Object.defineProperty(prototype, 'src', {
+                ...descriptor,
+                set(value) {
+                    const routed = typeof value === 'string' && isCardAudioSource(value)
+                        ? routeForDynamicValue(this, 'src', value, '父页面音频 src 赋值')
+                        : value;
+                    return descriptor.set.call(this, routed);
+                },
+            });
+        } catch (error) {
+            console.debug('[FrontendMediaLocalizer] 无法拦截父页面音频 src:', error);
+        }
+    };
+    patchSourceProperty(window.HTMLMediaElement?.prototype);
+    patchSourceProperty(window.HTMLSourceElement?.prototype);
+
+    const originalPlay = window.HTMLMediaElement?.prototype?.play;
+    if (originalPlay) {
+        window.HTMLMediaElement.prototype.play = function (...args) {
+            const info = mediaInfoFromElement(this);
+            if (info?.type === 'audio' && currentCandidates.has(info.source)) {
+                observeMediaElementActivity(this, '父页面 HTMLMediaElement.play()');
+            }
+            return originalPlay.apply(this, args);
+        };
+    }
+}
+
+function decodeSourceParameter(value) {
+    try {
+        const url = new URL(String(value).replaceAll('&amp;', '&'), location.origin);
+        const isLocalFile = url.pathname.startsWith(`${API_BASE}/file/`);
+        const isOfflineResource = url.pathname === OFFLINE_PLACEHOLDER_PATH || url.pathname.startsWith(`${OFFLINE_BLOCKED_PATH}-`);
+        if (!isLocalFile && !isOfflineResource) return null;
+        const encoded = url.searchParams.get('source');
+        if (!encoded) return null;
+        const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(encoded.length / 4) * 4, '=');
+        const bytes = Uint8Array.from(atob(base64), character => character.charCodeAt(0));
+        const source = new TextDecoder().decode(bytes);
+        return /^https?:\/\//i.test(source) ? source : null;
+    } catch { return null; }
+}
+
+function restoreText(text) {
+    if (typeof text !== 'string' || !text) return text;
+    let restored = text;
+    if (reverseRouteRegex) {
+        reverseRouteRegex.lastIndex = 0;
+        restored = restored.replace(reverseRouteRegex, match => reverseRouteMap.get(match) || decodeSourceParameter(match) || match);
+    }
+    const localPattern = new RegExp(`(?:https?:\\/\\/[^\\s<>"'\\)]+)?${escapeRegExp(API_BASE)}\\/file\\/[^\\s<>"'\\)]+`, 'g');
+    restored = restored.replace(localPattern, match => decodeSourceParameter(match.replaceAll('&amp;', '&')) || match);
+    const offlinePattern = new RegExp(`(?:https?:\\/\\/[^\\s<>"'\\)]+)?${escapeRegExp(EXTENSION_PUBLIC_PATH)}\\/(?:offline-placeholder\\.svg|offline-blocked-(?:audio|video)\\.bin)[^\\s<>"'\\)]*`, 'g');
+    return restored.replace(offlinePattern, match => decodeSourceParameter(match.replaceAll('&amp;', '&')) || match);
 }
 
 function rewriteMessage(messageId) {
-    if (!getSettings().enabled || !routeMap.size) return;
+    if (!getSettings().enabled || (!isOfflineMode() && (!getSettings().useLocalResources || !serverAvailable || !routeMap.size))) return;
     const hasMessageId = messageId !== null && messageId !== undefined && Number.isFinite(Number(messageId));
     const selector = hasMessageId ? `#chat > .mes[mesid="${Number(messageId)}"]` : '#chat > .mes';
     document.querySelectorAll(`${selector} pre code`).forEach(code => {
@@ -367,24 +1197,728 @@ function rewriteMessage(messageId) {
     });
 }
 
+function restoreMessage(messageId = null) {
+    const hasMessageId = messageId !== null && messageId !== undefined && Number.isFinite(Number(messageId));
+    const selector = hasMessageId ? `#chat > .mes[mesid="${Number(messageId)}"]` : '#chat > .mes';
+    document.querySelectorAll(`${selector} pre code`).forEach(code => {
+        const current = code.textContent || '';
+        const restored = restoreText(current);
+        if (restored !== current) code.textContent = restored;
+    });
+}
+
 function rewriteAllMessages() {
     rewriteMessage(null);
 }
 
 function rewriteIframe(iframe) {
-    if (!iframe?.contentDocument || !routeMap.size) return;
+    if (!iframe?.contentDocument || !getSettings().enabled || (!isOfflineMode() && (!serverAvailable || !getSettings().useLocalResources || !routeMap.size))) return;
     const documentRef = iframe.contentDocument;
+    bindDocumentMediaFallback(documentRef);
+    installDocumentRuntimeRouter(documentRef);
     documentRef.querySelectorAll('img[src], audio[src], video[src], source[src], video[poster]').forEach(element => {
         for (const attribute of ['src', 'poster']) {
             const value = element.getAttribute(attribute);
-            const replacement = value && routeMap.get(value);
-            if (replacement) element.setAttribute(attribute, replacement);
+            const replacement = value && routeForDynamicValue(element, attribute, value, `iframe 初始 ${attribute}`);
+            if (replacement && replacement !== value) setMediaAttributeWithoutRouting(element, attribute, replacement);
         }
     });
     documentRef.querySelectorAll('[style]').forEach(element => {
         const value = element.getAttribute('style');
         const replacement = rewriteText(value);
+        if (replacement !== value) setMediaAttributeWithoutRouting(element, 'style', replacement);
+    });
+    documentRef.querySelectorAll('style').forEach(element => {
+        const value = element.textContent || '';
+        const replacement = rewriteText(value);
+        if (replacement !== value) element.textContent = replacement;
+    });
+}
+
+function bindDocumentMediaFallback(documentRef) {
+    if (!documentRef || documentRef.documentElement?.dataset.fmlFallbackBound === 'true') return;
+    installDocumentRuntimeRouter(documentRef);
+    documentRef.addEventListener('error', handleLocalizedMediaError, true);
+    documentRef.addEventListener('load', handleMediaLoaded, true);
+    documentRef.addEventListener('loadeddata', handleMediaLoaded, true);
+    documentRef.addEventListener('loadedmetadata', handleMediaLoaded, true);
+    documentRef.addEventListener('canplay', handleMediaLoaded, true);
+    documentRef.addEventListener('play', handleMediaLoaded, true);
+    documentRef.addEventListener('playing', handleMediaLoaded, true);
+    const windowRef = documentRef.defaultView;
+    if (windowRef?.PerformanceObserver && !documentRef._fmlResourceObserver) {
+        try {
+            const observer = new windowRef.PerformanceObserver(list => {
+                for (const entry of list.getEntries()) processRuntimeResourceEntry(entry);
+                updateFloatingButton();
+            });
+            observer.observe({ type: 'resource', buffered: true });
+            documentRef._fmlResourceObserver = observer;
+        } catch { /* resource observation unavailable */ }
+    }
+    if (documentRef.documentElement) documentRef.documentElement.dataset.fmlFallbackBound = 'true';
+}
+
+function restoreDocumentResources(documentRef) {
+    if (!documentRef) return;
+    bindDocumentMediaFallback(documentRef);
+    documentRef.querySelectorAll('img[src], audio[src], video[src], source[src], video[poster]').forEach(element => {
+        for (const attribute of ['src', 'poster']) {
+            const value = element.getAttribute(attribute);
+            const replacement = value && (reverseRouteMap.get(value) || decodeSourceParameter(value));
+            if (replacement) element.setAttribute(attribute, replacement);
+        }
+    });
+    documentRef.querySelectorAll('[style]').forEach(element => {
+        const value = element.getAttribute('style');
+        const replacement = restoreText(value);
         if (replacement !== value) element.setAttribute('style', replacement);
+    });
+    documentRef.querySelectorAll('style').forEach(element => {
+        const value = element.textContent || '';
+        const replacement = restoreText(value);
+        if (replacement !== value) element.textContent = replacement;
+    });
+}
+
+function restoreAllLocalizedContent() {
+    restoreMessage(null);
+    restoreDocumentResources(document);
+    document.querySelectorAll('iframe').forEach(iframe => {
+        try { restoreDocumentResources(iframe.contentDocument); } catch { /* cross-origin iframe */ }
+    });
+}
+
+function applyCurrentResourcePolicy() {
+    if (!getSettings().enabled) return;
+    rewriteAllMessages();
+    document.querySelectorAll('#chat > .mes img[src], #chat > .mes audio[src], #chat > .mes video[src], #chat > .mes source[src], #chat > .mes video[poster]').forEach(element => {
+        for (const attribute of ['src', 'poster']) {
+            const value = element.getAttribute(attribute);
+            const replacement = value && routeForDynamicValue(element, attribute, value, `父页面当前内容 ${attribute}`);
+            if (replacement && replacement !== value) setMediaAttributeWithoutRouting(element, attribute, replacement);
+        }
+    });
+    document.querySelectorAll('iframe').forEach(iframe => {
+        try { rewriteIframe(iframe); } catch (error) { console.debug('[FrontendMediaLocalizer] 应用 iframe 资源策略失败:', error); }
+    });
+    for (const media of [...trackedMediaElements]) {
+        if (!media) {
+            trackedMediaElements.delete(media);
+            continue;
+        }
+        const value = media.getAttribute?.('src') || media.currentSrc;
+        if (!value) continue;
+        const replacement = routeForDynamicValue(media, 'src', value, '已跟踪媒体切换策略');
+        if (!replacement || replacement === value) continue;
+        const playback = captureMediaPlaybackState(media);
+        setMediaAttributeWithoutRouting(media, 'src', replacement);
+        try { media.load(); } catch { /* detached media */ }
+        if (!isOfflineResourceUrl(replacement)) restoreMediaPlaybackState(media, playback);
+    }
+}
+
+function handleLocalizedMediaError(event) {
+    const element = event.target;
+    if (!element || element.nodeType !== 1 || typeof element.getAttribute !== 'function') return;
+    let restored = false;
+    for (const attribute of ['src', 'poster']) {
+        const value = element.getAttribute(attribute);
+        const replacement = value && (reverseRouteMap.get(value) || decodeSourceParameter(value));
+        if (!replacement) continue;
+        const typeHint = attribute === 'poster' ? 'image' : runtimeTypeForElement(element, replacement, `媒体错误 ${attribute}`);
+        const info = currentCardResource(replacement, typeHint);
+        if (isOfflineMode() && info) {
+            const blockedUrl = offlineResourceUrl(info.source, info.type);
+            if (!isOfflineResourceUrl(value)) setMediaAttributeWithoutRouting(element, attribute, blockedUrl);
+            const media = ['audio', 'video'].includes(String(element.tagName || '').toLowerCase())
+                ? element
+                : ['audio', 'video'].includes(String(element.parentElement?.tagName || '').toLowerCase())
+                    ? element.parentElement
+                    : null;
+            if (media) {
+                try { media.pause(); } catch { /* already stopped */ }
+            }
+            if (info.type !== 'image') showOfflineMissingNotice(info.source, info.type);
+            continue;
+        }
+        setMediaAttributeWithoutRouting(element, attribute, replacement, true);
+        restored = true;
+    }
+    if (restored) void checkServer();
+}
+
+function mediaInfoFromElement(element) {
+    if (!element || element.nodeType !== 1 || typeof element.getAttribute !== 'function') return null;
+    const tag = String(element.tagName || '').toLowerCase();
+    const sourceParentTag = String(element.parentElement?.tagName || '').toLowerCase();
+    const sourceMimeType = String(element.type || '').split('/')[0];
+    const type = tag === 'img'
+        ? 'image'
+        : tag === 'audio'
+            ? 'audio'
+            : tag === 'video'
+                ? 'video'
+                : tag === 'source'
+                    ? (['audio', 'video'].includes(sourceParentTag) ? sourceParentTag : MEDIA_TYPES.includes(sourceMimeType) ? sourceMimeType : inferType(element.src || ''))
+                    : null;
+    if (!MEDIA_TYPES.includes(type)) return null;
+    const actual = element.currentSrc || element.src || element.getAttribute('src') || (type === 'video' ? element.poster : '');
+    if (!actual) return null;
+    const source = decodeSourceParameter(actual) || reverseRouteMap.get(actual) || normalizeCandidate(actual);
+    if (!source) return null;
+    const local = Boolean(canonicalLocalRoute(actual));
+    return { source, actual: String(actual), type, local };
+}
+
+function runtimeTypeForElement(element, source, context = '') {
+    const tag = String(element?.tagName || '').toLowerCase();
+    if (tag === 'img') return 'image';
+    if (tag === 'audio') return 'audio';
+    if (tag === 'video') return 'video';
+    if (tag === 'source') {
+        const parentTag = String(element.parentElement?.tagName || '').toLowerCase();
+        if (parentTag === 'audio' || parentTag === 'video') return parentTag;
+        const mimeType = String(element.type || '').split('/')[0];
+        if (MEDIA_TYPES.includes(mimeType)) return mimeType;
+    }
+    return inferType(source, `${context} ${tag}`);
+}
+
+function addRuntimeCandidate(source, type, reason) {
+    if (!source || !type || currentCandidates.has(source)) return;
+    currentCandidates.set(source, {
+        url: source,
+        type,
+        hint: type,
+        size: null,
+        contentType: null,
+        error: null,
+        selected: true,
+        fields: new Set([reason || '运行时加载']),
+        aliases: new Set([source]),
+        status: 'detected',
+    });
+    updateSettingsSummary();
+}
+
+function observeRuntimeSource(sourceValue, typeHint, reason, actualValue = sourceValue) {
+    if (!getSettings().enabled || !currentCard) return;
+    const actual = String(actualValue || sourceValue || '');
+    const source = decodeSourceParameter(actual) || reverseRouteMap.get(actual) || normalizeCandidate(sourceValue);
+    if (!source) return;
+    const type = typeHint || inferType(source, reason);
+    if (!MEDIA_TYPES.includes(type)) return;
+    addRuntimeCandidate(source, type, reason);
+    const local = Boolean(canonicalLocalRoute(actual));
+    if (getSettings().sniffingEnabled && !local) {
+        registerSniffedResource({ source, actual, type, local: false, cardName: currentCard.name });
+    }
+}
+
+function observeRuntimeValue(element, attribute, value, reason = '') {
+    if (!getSettings().enabled || !currentCard || typeof value !== 'string' || !value) return;
+    const context = `${reason} ${attribute}`;
+    if (['style', 'cssText', 'innerHTML', 'outerHTML', 'srcset'].includes(attribute)) {
+        const found = new Map();
+        collectFromString(value, context, found);
+        for (const item of found.values()) {
+            const type = runtimeTypeForElement(element, item.url, context) || item.type;
+            observeRuntimeSource(item.url, type, context);
+        }
+        return;
+    }
+    const normalized = decodeSourceParameter(value) || reverseRouteMap.get(value) || normalizeCandidate(value);
+    if (!normalized) return;
+    observeRuntimeSource(normalized, runtimeTypeForElement(element, normalized, context), context, value);
+}
+
+function observeMediaElementActivity(element, reason) {
+    const info = mediaInfoFromElement(element);
+    if (!info) return;
+    rememberMediaElement(element);
+    addRuntimeCandidate(info.source, info.type, reason);
+    setLatestLoadedResource(info, reason);
+    if (getSettings().sniffingEnabled && !info.local) registerSniffedResource(info);
+}
+
+function setLatestLoadedResource(info, reason) {
+    latestLoadedResource = { ...info, cardName: currentCard?.name || null, loadedAt: Date.now() };
+    const settings = getSettings();
+    const isLocal = Boolean(info.local && serverAvailable && settings.useLocalResources);
+    const offlineBlocked = isOfflineResourceUrl(info.actual);
+    const fallbackReason = offlineBlocked
+        ? '离线模式已阻止在线加载，当前显示缺失占位或阻断状态'
+        : !info.local
+        ? '实际加载的是原始在线地址'
+        : !serverAvailable
+            ? '后端未连接，已按回退逻辑显示云端'
+            : !settings.useLocalResources
+                ? '“使用本地资源”已关闭，已按回退逻辑显示云端'
+                : '通过本地资源路由加载';
+    console.info('[FrontendMediaLocalizer] 悬浮球资源判定', {
+        显示: isLocal ? '本地盒子' : '云朵',
+        类型: info.type,
+        原始链接: info.source,
+        实际加载链接: info.actual,
+        判定原因: fallbackReason,
+        离线模式: settings.offlineMode,
+        触发位置: reason,
+        后端已连接: serverAvailable,
+        使用本地资源: settings.useLocalResources,
+    });
+    updateFloatingButton();
+}
+
+function handleMediaLoaded(event) {
+    if (!getSettings().enabled) return;
+    const info = mediaInfoFromElement(event.target);
+    if (!info) return;
+    if (event.target.ownerDocument === document && !event.target.closest('#chat > .mes')) {
+        const isCurrentCardAudio = info.type === 'audio' && currentCandidates.has(info.source) && ['loadedmetadata', 'canplay', 'play', 'playing'].includes(event.type);
+        if (!isCurrentCardAudio) return;
+    }
+    observeMediaElementActivity(event.target, `媒体事件：${event.type || 'loaded'}`);
+}
+
+function sniffFilename(url, type, contentType = '') {
+    let name = '';
+    try { name = decodeURIComponent(new URL(url).pathname.split('/').pop() || ''); } catch { /* fallback below */ }
+    name = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/g, '').slice(0, 100);
+    const hasExtension = /\.[a-z0-9]{2,8}$/i.test(name);
+    const mimeExtension = String(contentType).split('/')[1]?.split(/[;+]/)[0]?.replace('jpeg', 'jpg');
+    const fallbackExtension = type === 'image' ? 'img' : type === 'audio' ? 'audio' : 'video';
+    if (!name) name = `resource-${Date.now()}.${mimeExtension || fallbackExtension}`;
+    else if (!hasExtension) name += `.${mimeExtension || fallbackExtension}`;
+    return name;
+}
+
+function sniffRecordKey(cardName, source) {
+    return `${cardName || ''}\n${source}`;
+}
+
+function registerSniffedResource(info) {
+    const settings = getSettings();
+    const cardName = info.cardName || currentCard?.name;
+    if (!settings.enabled || !cardName || !MEDIA_TYPES.includes(info.type) || settings.sniffBlockedUrls.includes(info.source)) return;
+    const key = sniffRecordKey(cardName, info.source);
+    if (sniffSeen.has(key) || currentLibrary.some(item => item.exists && item.source === info.source)) return;
+    sniffSeen.add(key);
+    const record = { ...info, id: crypto.randomUUID(), cardName, storageCardName: currentStorageCardName || cardName, state: 'ready', directFailed: false, createdAt: Date.now() };
+    sniffRecords.set(record.id, record);
+    if (settings.sniffNotifications) showSniffNotification(record);
+    if (settings.sniffAutoDownload && !settings.offlineMode) enqueueSniffAutoDownload(record);
+}
+
+function clearSniffNotifications() {
+    const container = document.querySelector('#fml-sniff-notification-container');
+    container?.querySelectorAll('.fml-sniff-notification').forEach(element => clearTimeout(element._fmlTimer));
+    container?.replaceChildren();
+}
+
+function ensureSniffContainer() {
+    let container = document.querySelector('#fml-sniff-notification-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'fml-sniff-notification-container';
+        container.className = 'fml-sniff-notifications';
+        container.addEventListener('click', handleSniffNotificationClick);
+        document.body.append(container);
+    }
+    return container;
+}
+
+function showOfflineMissingNotice(source, type) {
+    if (!isOfflineMode() || !['audio', 'video'].includes(type)) return;
+    const key = `${type}\n${source}`;
+    const now = Date.now();
+    if (now - (offlineNoticeTimes.get(key) || 0) < 1500) return;
+    offlineNoticeTimes.set(key, now);
+    if (offlineNoticeTimes.size > 200) {
+        for (const [item, time] of offlineNoticeTimes) {
+            if (now - time > 60000) offlineNoticeTimes.delete(item);
+        }
+    }
+
+    const container = ensureSniffContainer();
+    const element = document.createElement('div');
+    element.className = `fml-offline-notification is-${type} is-entering`;
+    element.dataset.offlineNotice = key;
+    element.innerHTML = `
+        <i class="fa-solid ${TYPE_ICONS[type]} fml-offline-type"></i>
+        <span class="fml-sniff-copy"><strong title="${escapeHtml(source)}">${escapeHtml(sniffFilename(source, type))}</strong><small>离线模式：本地${TYPE_LABELS[type]}缺失，已阻止在线加载</small></span>
+        <button class="fml-sniff-icon fml-offline-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>`;
+    element.querySelector('.fml-offline-close').addEventListener('click', () => dismissSniffNotification(element, true));
+    container.append(element);
+    element.addEventListener('animationend', () => element.classList.remove('is-entering'), { once: true });
+    const delay = Math.max(1, Number(getSettings().sniffNotificationSeconds) || 5) * 1000;
+    element._fmlTimer = setTimeout(() => dismissSniffNotification(element), delay);
+
+    const maximum = Math.max(1, Math.min(20, Number(getSettings().sniffMaxNotifications) || 3));
+    let active = [...container.children].filter(item => item.dataset.dismissing !== 'true').length;
+    while (active > maximum) {
+        const oldest = [...container.children].find(item => item !== element && item.dataset.dismissing !== 'true');
+        if (!oldest) break;
+        dismissSniffNotification(oldest, true);
+        active--;
+    }
+}
+
+function sniffStatusLabel(record) {
+    if (record.state === 'saving') return '正在保存…';
+    if (record.state === 'saved') return '已保存到本地';
+    if (record.state === 'awaiting-import') return '浏览器下载完成后点击导入';
+    if (record.state === 'failed') return record.error || '直接保存失败';
+    return record.local ? '本地资源' : '发现云端资源';
+}
+
+function notificationActionIcon(record) {
+    return record.state === 'awaiting-import' ? 'fa-file-import' : record.directFailed ? 'fa-floppy-disk' : 'fa-download';
+}
+
+function scheduleSniffNotification(element, record) {
+    clearTimeout(element._fmlTimer);
+    if (record.state === 'saving') return;
+    const delay = Math.max(1, Number(getSettings().sniffNotificationSeconds) || 5) * 1000;
+    element._fmlTimer = setTimeout(() => dismissSniffNotification(element), delay);
+}
+
+function dismissSniffNotification(element, fast = false) {
+    if (!element || element.dataset.dismissing === 'true') return;
+    clearTimeout(element._fmlTimer);
+    element.dataset.dismissing = 'true';
+    element.classList.add('is-leaving', fast ? 'is-leaving-fast' : 'is-leaving-timed');
+    setTimeout(() => element.remove(), fast ? 170 : 340);
+}
+
+function renderSniffNotification(element, record) {
+    const filename = sniffFilename(record.source, record.type);
+    element.className = `fml-sniff-notification is-${record.type} is-${record.state}`;
+    element.dataset.recordId = record.id;
+    element.innerHTML = `
+        <i class="fa-solid ${TYPE_ICONS[record.type]} fml-sniff-type"></i>
+        <span class="fml-sniff-copy"><strong title="${escapeHtml(record.source)}">${escapeHtml(filename)}</strong><small>${escapeHtml(sniffStatusLabel(record))}</small></span>
+        <button class="fml-sniff-icon fml-sniff-download" title="${record.state === 'awaiting-import' ? '导入刚才由浏览器下载的文件' : record.directFailed ? '写入已授权资源目录' : '下载到酒馆服务器资源目录'}"><i class="fa-solid ${notificationActionIcon(record)}"></i></button>
+        <button class="fml-sniff-icon fml-sniff-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>
+        <button class="fml-sniff-icon fml-sniff-more" title="更多"><i class="fa-solid fa-ellipsis"></i></button>
+        <button class="fml-sniff-block" hidden>不再通知此资源</button>`;
+    element.querySelectorAll('.fml-sniff-icon').forEach(button => button.disabled = record.state === 'saving');
+    scheduleSniffNotification(element, record);
+}
+
+function showSniffNotification(record) {
+    if (!getSettings().enabled || !getSettings().sniffingEnabled || !getSettings().sniffNotifications) return;
+    const container = ensureSniffContainer();
+    let element = container.querySelector(`[data-record-id="${CSS.escape(record.id)}"]`);
+    if (!element) {
+        element = document.createElement('div');
+        container.append(element);
+        element.addEventListener('mouseenter', () => clearTimeout(element._fmlTimer));
+        element.addEventListener('mouseleave', () => scheduleSniffNotification(element, record));
+    }
+    renderSniffNotification(element, record);
+    if (!element.dataset.animated) {
+        element.dataset.animated = 'true';
+        element.classList.add('is-entering');
+        element.addEventListener('animationend', () => element.classList.remove('is-entering'), { once: true });
+    }
+    const maximum = Math.max(1, Math.min(20, Number(getSettings().sniffMaxNotifications) || 3));
+    let active = [...container.children].filter(item => item.dataset.dismissing !== 'true').length;
+    while (active > maximum) {
+        const oldest = [...container.children].find(item => item.dataset.dismissing !== 'true');
+        if (!oldest) break;
+        dismissSniffNotification(oldest, true);
+        active--;
+    }
+}
+
+function updateSniffNotification(record) {
+    const element = document.querySelector(`#fml-sniff-notification-container [data-record-id="${CSS.escape(record.id)}"]`);
+    if (element) renderSniffNotification(element, record);
+    else if (record.state !== 'saved') showSniffNotification(record);
+}
+
+async function handleSniffNotificationClick(event) {
+    const element = event.target.closest('.fml-sniff-notification');
+    if (!element) return;
+    const record = sniffRecords.get(element.dataset.recordId);
+    if (!record) return element.remove();
+    if (event.target.closest('.fml-sniff-close')) return dismissSniffNotification(element, true);
+    if (event.target.closest('.fml-sniff-more')) {
+        const block = element.querySelector('.fml-sniff-block');
+        block.hidden = !block.hidden;
+        return;
+    }
+    if (event.target.closest('.fml-sniff-block')) {
+        const settings = getSettings();
+        if (!settings.sniffBlockedUrls.includes(record.source)) settings.sniffBlockedUrls.push(record.source);
+        saveSettings();
+        return dismissSniffNotification(element, true);
+    }
+    if (event.target.closest('.fml-sniff-download')) await handleManualSniffSave(record);
+}
+
+function enqueueSniffAutoDownload(record) {
+    if (sniffAutoQueue.some(item => item.id === record.id)) return;
+    sniffAutoQueue.push(record);
+    void runSniffAutoQueue();
+}
+
+async function runSniffAutoQueue() {
+    if (sniffAutoRunnerActive) return;
+    sniffAutoRunnerActive = true;
+    while (sniffAutoQueue.length) {
+        if (getSettings().offlineMode) {
+            sniffAutoQueue = [];
+            break;
+        }
+        const record = sniffAutoQueue.shift();
+        try { await saveSniffRecordDirect(record, false); } catch { /* state and notification handled by saver */ }
+    }
+    sniffAutoRunnerActive = false;
+}
+
+function safeDirectoryName(value, fallback) {
+    const cleaned = String(value || '').trim().replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/g, '').slice(0, 120);
+    return cleaned || fallback;
+}
+
+async function chooseResourceDirectory() {
+    if (!window.showDirectoryPicker) throw new Error('当前浏览器不支持文件夹授权');
+    const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    if (String(handle.name || '').toLowerCase() !== 'resources') throw new Error('请选择 SillyTavern/data/resources 文件夹');
+    if (!await handlePermission(handle, true)) throw new Error('未取得目录读写权限');
+    resourceDirectoryHandle = handle;
+    await storeResourceHandle(handle);
+    updateHandleStatus();
+    return handle;
+}
+
+async function requireResourceDirectory(interactive = true) {
+    if (!resourceDirectoryHandle) resourceDirectoryHandle = await readStoredHandle().catch(() => null);
+    if (resourceDirectoryHandle && await handlePermission(resourceDirectoryHandle, interactive)) return resourceDirectoryHandle;
+    if (!interactive) throw new Error('资源目录尚未授权');
+    return chooseResourceDirectory();
+}
+
+function updateHandleStatus() {
+    const element = document.querySelector('#fml-handle-status');
+    if (!element) return;
+    element.textContent = resourceDirectoryHandle ? `已选择：${resourceDirectoryHandle.name}` : '尚未选择资源目录（推荐选择 data/resources）';
+}
+
+async function availableResourceFilename(directory, requested) {
+    const extensionIndex = requested.lastIndexOf('.');
+    const base = extensionIndex > 0 ? requested.slice(0, extensionIndex) : requested;
+    const extension = extensionIndex > 0 ? requested.slice(extensionIndex) : '';
+    for (let index = 0; index < 1000; index++) {
+        const candidate = index ? `${base}-${index}${extension}` : requested;
+        try { await directory.getFileHandle(candidate); }
+        catch (error) { if (error?.name === 'NotFoundError') return candidate; throw error; }
+    }
+    return `${base}-${crypto.randomUUID().slice(0, 8)}${extension}`;
+}
+
+async function writeBlobToResourceDirectory(record, blob, preferredFilename = '', interactive = true) {
+    const root = await requireResourceDirectory(interactive);
+    const cardName = safeDirectoryName(record.storageCardName || record.cardName, 'Unnamed Character');
+    const requestedFilename = safeDirectoryName(preferredFilename || sniffFilename(record.source, record.type, blob.type), `resource-${Date.now()}`);
+    const cardDirectoryHandle = await root.getDirectoryHandle(cardName, { create: true });
+    const typeDirectoryHandle = await cardDirectoryHandle.getDirectoryHandle(record.type, { create: true });
+    const filename = await availableResourceFilename(typeDirectoryHandle, requestedFilename);
+    const fileHandle = await typeDirectoryHandle.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    try { await writable.write(blob); } finally { await writable.close(); }
+    const file = await fileHandle.getFile();
+    return { filename, size: file.size, contentType: file.type || blob.type || 'application/octet-stream' };
+}
+
+async function registerSavedResource(record, saved) {
+    const registration = {
+        card: record.cardName,
+        source: record.source,
+        type: record.type,
+        filename: saved.filename,
+        contentType: saved.contentType,
+    };
+    if (!serverAvailable) {
+        const settings = getSettings();
+        if (!settings.pendingSniffRegistrations.some(item => item.card === registration.card && item.source === registration.source)) {
+            settings.pendingSniffRegistrations.push(registration);
+            saveSettings();
+        }
+        return null;
+    }
+    const data = await api('/register-local', { method: 'POST', body: JSON.stringify(registration) });
+    await activateDownloadedResource(record.cardName, data.resource);
+    refreshAllCardsInline();
+    return data.resource;
+}
+
+async function syncPendingRegistrations() {
+    if (!serverAvailable) return;
+    const settings = getSettings();
+    const pending = Array.isArray(settings.pendingSniffRegistrations) ? [...settings.pendingSniffRegistrations] : [];
+    if (!pending.length) return;
+    const remaining = [];
+    for (const item of pending) {
+        try { await api('/register-local', { method: 'POST', body: JSON.stringify(item) }); }
+        catch { remaining.push(item); }
+    }
+    settings.pendingSniffRegistrations = remaining;
+    saveSettings();
+    if (currentCard) await loadLibrary(currentCard.name);
+}
+
+async function saveSniffRecordDirect(record, interactive = true) {
+    record.state = 'saving';
+    record.error = null;
+    updateSniffNotification(record);
+    try {
+        if (!serverAvailable) throw new Error('酒馆服务器端插件未连接');
+        const data = await api('/download', {
+            method: 'POST',
+            body: JSON.stringify({
+                card: record.cardName,
+                resources: [{ url: record.source, type: record.type }],
+                ratePolicy: getRatePolicy(),
+            }),
+        });
+        const result = data.results?.[0];
+        if (!result?.ok || !result.resource) throw new Error(result?.error || '服务器端下载失败');
+        const saved = result.resource;
+        await activateDownloadedResource(record.cardName, saved);
+        refreshAllCardsInline();
+        record.state = 'saved';
+        record.directFailed = false;
+        record.saved = saved;
+        updateSniffNotification(record);
+        return saved;
+    } catch (error) {
+        record.state = 'failed';
+        record.directFailed = true;
+        record.error = String(error.message || error);
+        updateSniffNotification(record);
+        throw error;
+    }
+}
+
+async function readSniffBlobFromBrowser(record) {
+    const source = String(record.actual || record.source || '');
+    let response;
+    try {
+        response = await fetch(source, {
+            method: 'GET',
+            mode: 'cors',
+            credentials: 'omit',
+            cache: 'force-cache',
+            referrerPolicy: 'no-referrer',
+        });
+    } catch (error) {
+        const wrapped = new Error('浏览器无法读取该资源，可能被资源网站的跨域策略阻止');
+        wrapped.code = 'FML_BROWSER_RESOURCE_UNREADABLE';
+        wrapped.cause = error;
+        throw wrapped;
+    }
+    if (!response.ok) throw new Error(`浏览器读取资源失败（HTTP ${response.status}）`);
+    const blob = await response.blob();
+    if (!blob.size) throw new Error('浏览器读取到的资源为空');
+    const majorType = String(blob.type || '').split('/')[0];
+    if (majorType && MEDIA_TYPES.includes(majorType) && majorType !== record.type) {
+        throw new Error(`资源类型不匹配：需要${TYPE_LABELS[record.type]}，实际为${TYPE_LABELS[majorType]}`);
+    }
+    return blob;
+}
+
+async function saveSniffRecordToAuthorizedDirectory(record) {
+    record.state = 'saving';
+    record.error = null;
+    updateSniffNotification(record);
+    try {
+        await requireResourceDirectory(true);
+        const blob = await readSniffBlobFromBrowser(record);
+        const saved = await writeBlobToResourceDirectory(record, blob, sniffFilename(record.source, record.type, blob.type), true);
+        const registered = await registerSavedResource(record, saved);
+        record.state = 'saved';
+        record.directFailed = false;
+        record.saved = registered || saved;
+        updateSniffNotification(record);
+        toastr.success(`已保存到 resources/${safeDirectoryName(record.storageCardName || record.cardName, 'Unnamed Character')}/${record.type}`, '资源嗅探');
+        return record.saved;
+    } catch (error) {
+        record.state = 'failed';
+        record.directFailed = true;
+        record.error = String(error.message || error);
+        updateSniffNotification(record);
+        throw error;
+    }
+}
+
+function triggerBrowserSaveAs(record) {
+    const anchor = document.createElement('a');
+    anchor.href = record.source;
+    anchor.download = sniffFilename(record.source, record.type);
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+}
+
+async function pickImportedFile(record) {
+    let file;
+    if (window.showOpenFilePicker) {
+        const [handle] = await window.showOpenFilePicker({ multiple: false });
+        file = await handle.getFile();
+    } else {
+        file = await new Promise((resolve, reject) => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = `${record.type}/*`;
+            input.onchange = () => input.files?.[0] ? resolve(input.files[0]) : reject(new Error('未选择文件'));
+            input.click();
+        });
+    }
+    if (!file?.size) throw new Error('选择的文件为空');
+    const major = String(file.type || '').split('/')[0];
+    if (major && major !== record.type) throw new Error(`请选择${TYPE_LABELS[record.type]}文件`);
+    const saved = await writeBlobToResourceDirectory(record, file, file.name, true);
+    await registerSavedResource(record, saved);
+    record.state = 'saved';
+    record.saved = saved;
+    updateSniffNotification(record);
+}
+
+async function handleManualSniffSave(record) {
+    try {
+        if (record.state === 'awaiting-import') return await pickImportedFile(record);
+        if (!record.directFailed) return await saveSniffRecordDirect(record, true);
+        if (!getSettings().sniffSaveAs) return toastr.info('请先在资源嗅探设置中开启“失败后允许另存为”', '资源嗅探');
+        if (!confirm('酒馆服务器直接下载失败。是否把浏览器已加载的资源直接写入已授权的 resources/角色卡/类型目录？')) return;
+        try {
+            return await saveSniffRecordToAuthorizedDirectory(record);
+        } catch (error) {
+            if (error?.name === 'AbortError') return;
+            const useBrowserDownload = confirm(`${error.message || String(error)}\n\n无法直接写入授权目录。是否改用浏览器默认下载？下载完成后再次点击通知按钮即可导入并登记映射。`);
+            if (!useBrowserDownload) return toastr.error(error.message || String(error), '资源嗅探');
+            triggerBrowserSaveAs(record);
+            record.state = 'awaiting-import';
+            record.error = null;
+            updateSniffNotification(record);
+        }
+    } catch (error) {
+        if (error?.name !== 'AbortError') toastr.error(error.message || String(error), '资源嗅探');
+    }
+}
+
+function scanLoadedMedia(documentRef) {
+    if (!documentRef) return;
+    bindDocumentMediaFallback(documentRef);
+    documentRef.querySelectorAll('img[src], audio[src], video[src], source[src]').forEach(element => {
+        const info = mediaInfoFromElement(element);
+        if (!info) return;
+        const loaded = info.type === 'image' ? Boolean(element.complete && element.naturalWidth) : Number(element.readyState) >= 2;
+        if (loaded) handleMediaLoaded({ target: element });
     });
 }
 
@@ -392,11 +1926,19 @@ function collectRuntimeResources(iframe) {
     if (!iframe?.contentWindow) return;
     let entries = [];
     try { entries = iframe.contentWindow.performance.getEntriesByType('resource'); } catch { return; }
-    for (const entry of entries) {
-        if (!['img', 'audio', 'video'].includes(entry.initiatorType) && !inferType(entry.name)) continue;
-        const url = normalizeCandidate(entry.name);
-        if (!url || currentCandidates.has(url)) continue;
-        const type = inferType(url, entry.initiatorType);
+    for (const entry of entries) processRuntimeResourceEntry(entry);
+    scanLoadedMedia(iframe.contentDocument);
+    updateFloatingButton();
+}
+
+function processRuntimeResourceEntry(entry) {
+    if (!getSettings().enabled) return;
+    if (!['img', 'audio', 'video'].includes(entry?.initiatorType) && !inferType(entry?.name)) return;
+    const url = normalizeCandidate(entry.name);
+    if (!url) return;
+    const type = inferType(url, entry.initiatorType);
+    if (!type) return;
+    if (!currentCandidates.has(url)) {
         currentCandidates.set(url, {
             url,
             type,
@@ -410,7 +1952,14 @@ function collectRuntimeResources(iframe) {
             status: 'detected',
         });
     }
-    updateFloatingButton();
+    const localUrl = routeMap.get(url);
+    if (localUrl && shouldUseLocalRoutes()) {
+        console.debug('[FrontendMediaLocalizer] 忽略已映射资源的旧云端性能记录', { 原始链接: url, 本地链接: localUrl });
+        return;
+    }
+    const info = { source: url, actual: url, type, local: false, cardName: currentCard?.name || null };
+    setLatestLoadedResource(info, '浏览器运行时资源记录');
+    if (getSettings().enabled && getSettings().sniffingEnabled) registerSniffedResource(info);
 }
 
 async function handleCardChange() {
@@ -418,12 +1967,17 @@ async function handleCardChange() {
     const card = await getActiveCard();
     if (sequence !== cardChangeSequence) return;
     currentCard = card;
+    currentStorageCardName = card?.name || null;
     currentCandidates = card ? collectRemoteResources(card.character) : new Map();
     currentLibrary = [];
+    latestLoadedResource = null;
+    sniffSeen = new Set();
+    clearSniffNotifications();
     setRouteMap([]);
     if (card && serverAvailable) await loadLibrary(card.name).catch(error => toastr.error(error.message, '资源本地化'));
     if (sequence !== cardChangeSequence) return;
     rewriteAllMessages();
+    if (isOfflineMode()) applyCurrentResourcePolicy();
     updateFloatingButton();
     updateSettingsSummary();
 }
@@ -441,13 +1995,20 @@ function updateFloatingButton() {
     const displayedTask = hasQueue ? downloadQueue[Math.min(queueDisplayIndex, downloadQueue.length - 1)] : null;
     const detected = [...currentCandidates.values()].filter(item => MEDIA_TYPES.includes(item.type) || !item.type).length;
     const pending = unresolvedCandidates().filter(item => MEDIA_TYPES.includes(item.type) || !item.type).length;
-    button.hidden = !(settings.enabled && settings.showFloatingButton && (hasQueue || (currentCard && detected > 0)));
+    button.hidden = !(settings.enabled && settings.showFloatingButton && (hasQueue || currentCard));
     button.classList.toggle('is-downloading', hasQueue);
     button.classList.toggle('has-pending', !hasQueue && pending > 0);
     const icon = button.querySelector('.fml-floating-icon');
     const progress = button.querySelector('.fml-floating-progress');
     const progressPercent = button.querySelector('.fml-progress-percent');
     const progressCount = button.querySelector('.fml-progress-count');
+    const latestLocal = Boolean(latestLoadedResource?.local && serverAvailable && settings.useLocalResources);
+    if (icon) {
+        icon.className = `fa-solid ${latestLocal ? 'fa-box-archive' : 'fa-cloud'} fml-floating-icon`;
+        icon.title = latestLocal ? '最新资源：本地' : '最新资源：云端';
+    }
+    button.classList.toggle('is-local-source', latestLocal);
+    button.classList.toggle('is-cloud-source', !latestLocal);
     if (displayedTask) {
         const processed = displayedTask.completed + displayedTask.failed;
         const percent = displayedTask.total ? Math.round(processed / displayedTask.total * 100) : 0;
@@ -463,7 +2024,7 @@ function updateFloatingButton() {
         button.style.removeProperty('--fml-queue-color');
         button.title = pending > 0 ? `发现 ${pending} 个尚未本地化的在线资源` : `已管理 ${currentLibrary.length} 个资源`;
     }
-    if (icon) icon.hidden = hasQueue;
+    if (icon) icon.hidden = false;
     if (progress) progress.hidden = !hasQueue;
     const badge = button.querySelector('.fml-floating-badge');
     if (badge) {
@@ -476,6 +2037,157 @@ function updateFloatingButton() {
             badge.hidden = pending === 0;
         }
     }
+}
+
+function activateFloatingButton() {
+    if (downloadQueue.length) {
+        const currentCardQueued = currentCard && downloadQueue.some(task => task.cardName === currentCard.name);
+        if (currentCard && !currentCardQueued && unresolvedCandidates().length) return openScanModal();
+        queueDisplayIndex = (queueDisplayIndex + 1) % downloadQueue.length;
+        const task = downloadQueue[queueDisplayIndex];
+        const processed = task.completed + task.failed;
+        const stateText = task.status === 'running' ? '下载中' : '等待中';
+        updateFloatingButton();
+        toastr.info(`${task.cardName}：${stateText} ${processed}/${task.total}，失败 ${task.failed}（${queueDisplayIndex + 1}/${downloadQueue.length}）`, '下载队列');
+        return;
+    }
+    const pending = unresolvedCandidates();
+    if (pending.length) openScanModal();
+    else openLibraryModal();
+}
+
+function floatingPositionMode() {
+    return isMobileLayout() ? 'mobile' : 'desktop';
+}
+
+function clampFloatingButton(button) {
+    if (!button || button.hidden) return;
+    const rect = button.getBoundingClientRect();
+    const viewport = window.visualViewport;
+    const viewportLeft = viewport?.offsetLeft || 0;
+    const viewportTop = viewport?.offsetTop || 0;
+    const viewportWidth = viewport?.width || window.innerWidth;
+    const viewportHeight = viewport?.height || window.innerHeight;
+    const margin = 8;
+    const left = Math.min(viewportLeft + viewportWidth - rect.width - margin, Math.max(viewportLeft + margin, rect.left));
+    const top = Math.min(viewportTop + viewportHeight - rect.height - margin, Math.max(viewportTop + margin, rect.top));
+    button.style.left = `${Math.round(left)}px`;
+    button.style.top = `${Math.round(top)}px`;
+    button.style.right = 'auto';
+    button.style.bottom = 'auto';
+}
+
+function applyFloatingPosition(button = document.querySelector('#fml-floating-button')) {
+    if (!button) return;
+    const mode = floatingPositionMode();
+    floatingViewportMode = mode;
+    const position = getSettings().floatingPositions?.[mode];
+    if (position && Number.isFinite(position.x) && Number.isFinite(position.y)) {
+        button.style.left = `${position.x}px`;
+        button.style.top = `${position.y}px`;
+        button.style.right = 'auto';
+        button.style.bottom = 'auto';
+        requestAnimationFrame(() => clampFloatingButton(button));
+    } else {
+        const viewport = window.visualViewport;
+        const viewportLeft = viewport?.offsetLeft || 0;
+        const viewportTop = viewport?.offsetTop || 0;
+        const viewportWidth = viewport?.width || window.innerWidth;
+        const viewportHeight = viewport?.height || window.innerHeight;
+        const size = button.offsetWidth || 52;
+        const rightGap = isMobileLayout() ? 12 : 18;
+        const bottomGap = isMobileLayout() ? 84 : 88;
+        button.style.left = `${Math.max(8, Math.round(viewportLeft + viewportWidth - size - rightGap))}px`;
+        button.style.top = `${Math.max(8, Math.round(viewportTop + viewportHeight - size - bottomGap))}px`;
+        button.style.right = 'auto';
+        button.style.bottom = 'auto';
+    }
+}
+
+function saveFloatingPosition(button) {
+    const rect = button.getBoundingClientRect();
+    const settings = getSettings();
+    settings.floatingPositions ||= { desktop: null, mobile: null };
+    settings.floatingPositions[floatingPositionMode()] = { x: Math.round(rect.left), y: Math.round(rect.top) };
+    saveSettings();
+}
+
+function hideFloatingButtonFromControl() {
+    const settings = getSettings();
+    settings.showFloatingButton = false;
+    const setting = document.querySelector('#fml-show-floating');
+    if (setting) setting.checked = false;
+    saveSettings();
+    updateFloatingButton();
+}
+
+function bindFloatingDrag(button) {
+    let drag = null;
+    let ignoreMouseUntil = 0;
+    const pointFromEvent = event => event.touches?.[0] || event.changedTouches?.[0] || event;
+    const start = event => {
+        if (event.target.closest('.fml-floating-close') || (event.pointerType === 'mouse' && event.button !== 0)) return;
+        if (drag) return;
+        const point = pointFromEvent(event);
+        const rect = button.getBoundingClientRect();
+        drag = { id: event.pointerId, x: point.clientX, y: point.clientY, left: rect.left, top: rect.top, moved: false };
+        if (event.pointerId !== undefined) button.setPointerCapture?.(event.pointerId);
+        button.classList.add('is-dragging');
+        button.focus({ preventScroll: true });
+        event.preventDefault();
+    };
+    const move = event => {
+        if (!drag || (drag.id !== undefined && event.pointerId !== undefined && drag.id !== event.pointerId)) return;
+        const point = pointFromEvent(event);
+        const dx = point.clientX - drag.x;
+        const dy = point.clientY - drag.y;
+        if (Math.hypot(dx, dy) > 5) drag.moved = true;
+        button.style.left = `${drag.left + dx}px`;
+        button.style.top = `${drag.top + dy}px`;
+        button.style.right = 'auto';
+        button.style.bottom = 'auto';
+        clampFloatingButton(button);
+        event.preventDefault();
+    };
+    const finish = event => {
+        if (!drag || (drag.id !== undefined && event.pointerId !== undefined && drag.id !== event.pointerId)) return;
+        const moved = drag.moved;
+        const pointerId = drag.id;
+        drag = null;
+        button.classList.remove('is-dragging');
+        if (pointerId !== undefined) button.releasePointerCapture?.(pointerId);
+        if (moved) saveFloatingPosition(button);
+        else activateFloatingButton();
+        event.preventDefault();
+    };
+    button.addEventListener('pointerdown', start);
+    button.addEventListener('pointermove', move);
+    button.addEventListener('pointerup', finish);
+    button.addEventListener('pointercancel', event => {
+        if (!drag || drag.id !== event.pointerId) return;
+        drag = null;
+        button.classList.remove('is-dragging');
+        clampFloatingButton(button);
+    });
+    button.addEventListener('touchstart', event => {
+        ignoreMouseUntil = Date.now() + 700;
+        if (drag) return;
+        start(event);
+    }, { passive: false });
+    button.addEventListener('touchmove', move, { passive: false });
+    button.addEventListener('touchend', finish, { passive: false });
+    button.addEventListener('touchcancel', event => {
+        if (!drag) return;
+        drag = null;
+        button.classList.remove('is-dragging');
+        clampFloatingButton(button);
+        event.preventDefault();
+    }, { passive: false });
+    button.addEventListener('mousedown', event => {
+        if (Date.now() >= ignoreMouseUntil) start(event);
+    });
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', finish);
 }
 
 function updateSettingsSummary() {
@@ -492,42 +2204,40 @@ function updateSettingsSummary() {
 
 function injectFloatingButton() {
     if (document.querySelector('#fml-floating-button')) return;
-    const button = document.createElement('button');
+    const button = document.createElement('div');
     button.id = 'fml-floating-button';
     button.className = 'fml-floating-button';
+    button.tabIndex = 0;
+    button.setAttribute('role', 'button');
+    button.setAttribute('aria-label', '前端卡资源本地化');
     button.hidden = true;
     button.innerHTML = `
-        <i class="fa-solid fa-box-archive fml-floating-icon"></i>
+        <i class="fa-solid fa-cloud fml-floating-icon"></i>
         <span class="fml-floating-progress" hidden>
             <strong class="fml-progress-percent">0%</strong>
             <small class="fml-progress-count">0/0</small>
         </span>
-        <span class="fml-floating-badge" hidden>0</span>`;
-    button.addEventListener('click', () => {
-        if (downloadQueue.length) {
-            const currentCardQueued = currentCard && downloadQueue.some(task => task.cardName === currentCard.name);
-            if (currentCard && !currentCardQueued && unresolvedCandidates().length) {
-                openScanModal();
-                return;
-            }
-            queueDisplayIndex = (queueDisplayIndex + 1) % downloadQueue.length;
-            const task = downloadQueue[queueDisplayIndex];
-            const processed = task.completed + task.failed;
-            const stateText = task.status === 'running' ? '下载中' : '等待中';
-            updateFloatingButton();
-            toastr.info(`${task.cardName}：${stateText} ${processed}/${task.total}，失败 ${task.failed}（${queueDisplayIndex + 1}/${downloadQueue.length}）`, '下载队列');
-            return;
-        }
-        const pending = unresolvedCandidates();
-        if (pending.length) openScanModal();
-        else openLibraryModal();
+        <span class="fml-floating-badge" hidden>0</span>
+        <button class="fml-floating-close" type="button" title="关闭悬浮球" aria-label="关闭悬浮球"><i class="fa-solid fa-xmark"></i></button>`;
+    button.querySelector('.fml-floating-close').addEventListener('pointerdown', event => event.stopPropagation());
+    button.querySelector('.fml-floating-close').addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        hideFloatingButtonFromControl();
     });
+    button.addEventListener('keydown', event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        activateFloatingButton();
+    });
+    bindFloatingDrag(button);
     document.body.append(button);
+    applyFloatingPosition(button);
 }
 
 function injectSettingsPanel() {
     if (document.querySelector('#fml-settings')) return;
-    const container = document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings_container');
+    const container = document.querySelector('#extensions_settings2') || document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings_container');
     if (!container) return;
     const settings = getSettings();
     const panel = document.createElement('div');
@@ -550,8 +2260,33 @@ function injectSettingsPanel() {
                 </div>
                 <div class="fml-settings-module">
                     <div class="fml-module-title">检测与悬浮球</div>
-                    <label class="fml-check-row"><span>启用资源本地化</span><input id="fml-enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}></label>
+                    <label class="fml-check-row"><span>启用开关</span><input id="fml-enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}></label>
+                    <label class="fml-check-row"><span>使用本地资源</span><input id="fml-use-local" type="checkbox" ${settings.useLocalResources ? 'checked' : ''} ${settings.offlineMode ? 'disabled' : ''}></label>
+                    <label class="fml-check-row"><span>离线模式</span><input id="fml-offline-mode" type="checkbox" ${settings.offlineMode ? 'checked' : ''}></label>
                     <label class="fml-check-row"><span>显示悬浮球</span><input id="fml-show-floating" type="checkbox" ${settings.showFloatingButton ? 'checked' : ''}></label>
+                    <small>离线模式仅限制当前前端卡的图片、音频和视频；本地缺失时图片显示占位，音频和视频停止并提示。手动扫描下载仍可联网补齐。</small>
+                </div>
+                <div class="fml-settings-module">
+                    <div class="fml-module-title">资源嗅探</div>
+                    <label class="fml-check-row"><span>启用资源嗅探</span><input id="fml-sniff-enabled" type="checkbox" ${settings.sniffingEnabled ? 'checked' : ''}></label>
+                    <label class="fml-check-row"><span>接收嗅探通知</span><input id="fml-sniff-notifications" type="checkbox" ${settings.sniffNotifications ? 'checked' : ''}></label>
+                    <label class="fml-check-row"><span>自动下载嗅探资源</span><input id="fml-sniff-auto" type="checkbox" ${settings.sniffAutoDownload ? 'checked' : ''} ${settings.offlineMode ? 'disabled' : ''}></label>
+                    <label class="fml-check-row"><span>失败后允许另存为</span><input id="fml-sniff-save-as" type="checkbox" ${settings.sniffSaveAs ? 'checked' : ''}></label>
+                    <label class="fml-number-row"><span>最多同时显示</span><span><input id="fml-sniff-max" class="text_pole" type="number" min="1" max="20" step="1" value="${escapeHtml(settings.sniffMaxNotifications)}"> 条</span></label>
+                    <label class="fml-number-row"><span>通知显示时间</span><span><input id="fml-sniff-seconds" class="text_pole" type="number" min="1" max="300" step="1" value="${escapeHtml(settings.sniffNotificationSeconds)}"> 秒</span></label>
+                    <div id="fml-handle-status" class="fml-current-summary">尚未选择资源目录（推荐选择 data/resources）</div>
+                    <div class="fml-settings-actions">
+                        <button id="fml-choose-resource-folder" class="menu_button"><i class="fa-solid fa-folder-open"></i> 授权资源目录</button>
+                        <button id="fml-clear-sniff-blocks" class="menu_button"><i class="fa-solid fa-bell"></i> 清除不再通知列表</button>
+                    </div>
+                    <small>普通下载和自动下载由酒馆服务器直接保存到 data/resources/角色卡/类型。直接下载失败且启用另存为后，手动再次点击会优先读取浏览器已加载的资源并写入已授权目录，同时登记本地映射；只有跨域等限制导致浏览器无法读取时，才会询问是否改用默认下载并手动导入。</small>
+                </div>
+                <div class="fml-settings-module">
+                    <div class="fml-module-title">网站请求速率</div>
+                    <label class="fml-rate-default"><span>默认最小请求间隔</span><span><input id="fml-default-rate" class="text_pole" type="number" min="0.1" max="3600" step="0.1" value="${escapeHtml(normalizeRateSeconds(settings.defaultRequestIntervalSeconds, 1))}"> 秒</span></label>
+                    <div class="fml-rate-heading"><span>单独网站规则</span><button id="fml-add-rate-rule" class="menu_button" type="button"><i class="fa-solid fa-plus"></i> 添加网站</button></div>
+                    <div id="fml-rate-rules" class="fml-rate-rules"></div>
+                    <small>填写域名即可，例如 files.catbox.moe。规则同时作用于该域名及其子域名；估算与下载均受限制，并发固定为 1。</small>
                 </div>
                 <div class="fml-settings-module">
                     <div class="fml-module-title">当前角色卡</div>
@@ -574,17 +2309,142 @@ function injectSettingsPanel() {
         </div>`;
     container.append(panel);
 
+    const rateRules = panel.querySelector('#fml-rate-rules');
+    renderRateRuleRows(rateRules, settings);
+
     panel.querySelector('#fml-enabled').addEventListener('change', async event => {
         settings.enabled = event.target.checked;
         saveSettings();
+        if (!settings.enabled) {
+            clearSniffNotifications();
+            sniffAutoQueue = [];
+        }
         updateFloatingButton();
-        if (settings.enabled) rewriteAllMessages();
+        if (settings.enabled && isOfflineMode()) applyCurrentResourcePolicy();
+        else if (settings.enabled && serverAvailable) rewriteAllMessages();
+        else restoreAllLocalizedContent();
         await rerenderFrontendFrames();
+        if (!settings.enabled) restoreAllLocalizedContent();
+        else if (isOfflineMode()) applyCurrentResourcePolicy();
+    });
+    panel.querySelector('#fml-use-local').addEventListener('change', async event => {
+        settings.useLocalResources = event.target.checked;
+        saveSettings();
+        if (settings.useLocalResources && serverAvailable) {
+            rewriteAllMessages();
+            await rerenderFrontendFrames();
+        } else {
+            restoreAllLocalizedContent();
+            await rerenderFrontendFrames();
+            restoreAllLocalizedContent();
+        }
+        updateFloatingButton();
+    });
+    panel.querySelector('#fml-offline-mode').addEventListener('change', event => {
+        settings.offlineMode = event.target.checked;
+        const useLocal = panel.querySelector('#fml-use-local');
+        const sniffAuto = panel.querySelector('#fml-sniff-auto');
+        if (settings.offlineMode) {
+            settings.useLocalResources = true;
+            settings.sniffAutoDownload = false;
+            sniffAutoQueue = [];
+            if (useLocal) useLocal.checked = true;
+            if (sniffAuto) sniffAuto.checked = false;
+        }
+        if (useLocal) useLocal.disabled = settings.offlineMode;
+        if (sniffAuto) sniffAuto.disabled = settings.offlineMode;
+        saveSettings();
+        if (settings.offlineMode) {
+            applyCurrentResourcePolicy();
+            toastr.info('已进入离线模式；缺失媒体不会再访问在线图床', '资源本地化');
+        } else {
+            restoreAllLocalizedContent();
+            if (serverAvailable && settings.enabled && settings.useLocalResources) applyCurrentResourcePolicy();
+            toastr.info('已退出离线模式；缺失资源可回退到原在线地址', '资源本地化');
+        }
+        updateFloatingButton();
+        updateSettingsSummary();
     });
     panel.querySelector('#fml-show-floating').addEventListener('change', event => {
         settings.showFloatingButton = event.target.checked;
         saveSettings();
         updateFloatingButton();
+        if (settings.showFloatingButton) applyFloatingPosition();
+    });
+    panel.querySelector('#fml-sniff-enabled').addEventListener('change', event => {
+        settings.sniffingEnabled = event.target.checked;
+        saveSettings();
+        sniffSeen = new Set();
+        if (!settings.sniffingEnabled) clearSniffNotifications();
+        else if (settings.enabled) document.querySelectorAll('iframe').forEach(iframe => scanLoadedMedia(iframe.contentDocument));
+    });
+    panel.querySelector('#fml-sniff-notifications').addEventListener('change', event => {
+        settings.sniffNotifications = event.target.checked;
+        saveSettings();
+        if (!settings.sniffNotifications) clearSniffNotifications();
+        else if (settings.enabled && settings.sniffingEnabled) {
+            for (const record of sniffRecords.values()) {
+                if (record.state !== 'saved') showSniffNotification(record);
+            }
+        }
+    });
+    panel.querySelector('#fml-sniff-auto').addEventListener('change', event => {
+        if (settings.offlineMode) {
+            event.target.checked = false;
+            return;
+        }
+        settings.sniffAutoDownload = event.target.checked;
+        saveSettings();
+    });
+    panel.querySelector('#fml-sniff-save-as').addEventListener('change', event => {
+        settings.sniffSaveAs = event.target.checked;
+        saveSettings();
+    });
+    panel.querySelector('#fml-sniff-max').addEventListener('change', event => {
+        settings.sniffMaxNotifications = Math.max(1, Math.min(20, Number(event.target.value) || 3));
+        event.target.value = settings.sniffMaxNotifications;
+        saveSettings();
+    });
+    panel.querySelector('#fml-sniff-seconds').addEventListener('change', event => {
+        settings.sniffNotificationSeconds = Math.max(1, Math.min(300, Number(event.target.value) || 5));
+        event.target.value = settings.sniffNotificationSeconds;
+        saveSettings();
+    });
+    panel.querySelector('#fml-choose-resource-folder').addEventListener('click', async () => {
+        try { await chooseResourceDirectory(); toastr.success('资源目录授权成功', '资源嗅探'); }
+        catch (error) { if (error?.name !== 'AbortError') toastr.error(error.message || String(error), '资源嗅探'); }
+    });
+    panel.querySelector('#fml-clear-sniff-blocks').addEventListener('click', () => {
+        settings.sniffBlockedUrls = [];
+        saveSettings();
+        toastr.success('已清除不再通知列表', '资源嗅探');
+    });
+    panel.querySelector('#fml-default-rate').addEventListener('change', event => {
+        settings.defaultRequestIntervalSeconds = normalizeRateSeconds(event.target.value, 1);
+        event.target.value = settings.defaultRequestIntervalSeconds;
+        saveSettings();
+    });
+    panel.querySelector('#fml-add-rate-rule').addEventListener('click', () => {
+        saveRateRulesFromPanel(panel, settings);
+        settings.siteRateRules.push({ domain: '', intervalSeconds: settings.defaultRequestIntervalSeconds });
+        renderRateRuleRows(rateRules, settings);
+        rateRules.querySelector('.fml-rate-rule:last-child .fml-rate-domain')?.focus();
+    });
+    rateRules.addEventListener('change', event => {
+        if (!event.target.matches('.fml-rate-domain, .fml-rate-seconds')) return;
+        if (event.target.matches('.fml-rate-domain')) {
+            event.target.classList.toggle('fml-input-invalid', Boolean(event.target.value.trim()) && !normalizeRateDomain(event.target.value));
+        } else {
+            event.target.value = normalizeRateSeconds(event.target.value, 1);
+        }
+        saveRateRulesFromPanel(panel, settings);
+    });
+    rateRules.addEventListener('click', event => {
+        const button = event.target.closest('.fml-rate-remove');
+        if (!button) return;
+        button.closest('.fml-rate-rule')?.remove();
+        saveRateRulesFromPanel(panel, settings);
+        renderRateRuleRows(rateRules, settings);
     });
     panel.querySelector('#fml-scan-now').addEventListener('click', openScanModal);
     panel.querySelector('#fml-manage-now').addEventListener('click', () => openLibraryModal());
@@ -593,6 +2453,7 @@ function injectSettingsPanel() {
     panel.querySelector('#fml-all-cards-inline-list').addEventListener('click', handleInlineCardAction);
     panel.querySelector('#fml-install-backend-settings').addEventListener('click', () => openBackendInstaller());
     updateSettingsSummary();
+    updateHandleStatus();
     checkServer();
     refreshAllCardsInline();
     if (!allCardsPollTimer) allCardsPollTimer = setInterval(refreshAllCardsInline, 3000);
@@ -740,7 +2601,7 @@ async function probeCandidates(modal, items, allItems = items) {
         try {
             const data = await api('/probe', {
                 method: 'POST',
-                body: JSON.stringify({ resources: batch.map(item => ({ url: item.url, hint: item.hint })) }),
+                body: JSON.stringify({ resources: batch.map(item => ({ url: item.url, hint: item.hint })), ratePolicy: getRatePolicy() }),
             });
             for (const result of data.resources ?? []) {
                 const item = items.find(candidate => candidate.url === result.url);
@@ -833,12 +2694,17 @@ async function runDownloadTask(task) {
         try {
             const data = await api('/download', {
                 method: 'POST',
-                body: JSON.stringify({ card: cardName, resources: batch.map(item => ({ url: item.url, type: item.type })) }),
+                body: JSON.stringify({ card: cardName, resources: batch.map(item => ({ url: item.url, type: item.type })), ratePolicy: getRatePolicy() }),
             });
             for (const result of data.results ?? []) {
                 const item = items.find(candidate => candidate.url === (result.resource?.source || result.url));
                 if (!item) continue;
-                if (result.ok) { item.status = 'done'; item.error = null; task.completed++; }
+                if (result.ok) {
+                    item.status = 'done';
+                    item.error = null;
+                    task.completed++;
+                    await activateDownloadedResource(cardName, result.resource);
+                }
                 else { item.status = 'error'; item.error = result.error; item.selected = false; task.failed++; }
             }
         } catch (error) {
@@ -850,15 +2716,6 @@ async function runDownloadTask(task) {
             });
         }
         updateFloatingButton();
-    }
-    try {
-        if (currentCard?.name === cardName) {
-            await loadLibrary(cardName);
-            rewriteAllMessages();
-            await rerenderFrontendFrames();
-        }
-    } catch (error) {
-        console.error('[FrontendMediaLocalizer] Failed to refresh localized routes:', error);
     }
 }
 
@@ -1084,19 +2941,49 @@ function initializeEvents() {
     eventSource.on(event_types.CHARACTER_EDITED, () => setTimeout(handleCardChange, 100));
     eventSource.on('message_iframe_render_ended', iframeId => {
         const iframe = document.getElementById(iframeId);
-        rewriteIframe(iframe);
+        if (getSettings().enabled && (isOfflineMode() || (serverAvailable && getSettings().useLocalResources))) rewriteIframe(iframe);
+        else restoreDocumentResources(iframe?.contentDocument);
         collectRuntimeResources(iframe);
     });
+    document.addEventListener('error', handleLocalizedMediaError, true);
+    document.addEventListener('load', handleMediaLoaded, true);
+    document.addEventListener('loadeddata', handleMediaLoaded, true);
+    document.addEventListener('loadedmetadata', handleMediaLoaded, true);
+    document.addEventListener('canplay', handleMediaLoaded, true);
+    document.addEventListener('play', handleMediaLoaded, true);
+    document.addEventListener('playing', handleMediaLoaded, true);
 }
 
 jQuery(async () => {
     getSettings();
+    resourceDirectoryHandle = await readStoredHandle().catch(() => null);
     injectFloatingButton();
     injectSettingsPanel();
+    installTopLevelAudioRouter();
     initializeEvents();
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshAllCardsInline(); });
+    const handleViewportChange = () => {
+        const button = document.querySelector('#fml-floating-button');
+        const mode = floatingPositionMode();
+        if (mode !== floatingViewportMode) applyFloatingPosition(button);
+        else clampFloatingButton(button);
+    };
+    window.addEventListener('resize', handleViewportChange, { passive: true });
+    window.visualViewport?.addEventListener('resize', handleViewportChange, { passive: true });
+    window.visualViewport?.addEventListener('scroll', handleViewportChange, { passive: true });
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        refreshAllCardsInline();
+        void refreshCurrentLibrarySilently();
+    });
+    if (!serverHealthTimer) serverHealthTimer = setInterval(() => void checkServer(), 5000);
+    if (!currentLibraryPollTimer) currentLibraryPollTimer = setInterval(() => void refreshCurrentLibrarySilently(), 10000);
     await checkServer();
     await handleCardChange();
+    document.querySelectorAll('iframe').forEach(iframe => {
+        if (getSettings().enabled && (isOfflineMode() || (serverAvailable && getSettings().useLocalResources))) rewriteIframe(iframe);
+        else restoreDocumentResources(iframe.contentDocument);
+        collectRuntimeResources(iframe);
+    });
     if (!serverAvailable && !backendInstallPrompted) {
         backendInstallPrompted = true;
         const message = backendUpdateRequired

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title description">
+  <title id="title">本地图片缺失</title>
+  <desc id="description">离线模式已阻止加载在线图片</desc>
+  <rect width="1280" height="720" fill="#17191d"/>
+  <rect x="36" y="36" width="1208" height="648" rx="24" fill="none" stroke="#c94d55" stroke-width="6" stroke-dasharray="18 14"/>
+  <g transform="translate(540 185)" fill="none" stroke="#e4777d" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="0" y="0" width="200" height="160" rx="18"/>
+    <circle cx="58" cy="52" r="19"/>
+    <path d="M20 138l49-49 38 38 25-25 48 36M22 22l156 116"/>
+  </g>
+  <text x="640" y="430" fill="#f3f4f6" font-family="system-ui, sans-serif" font-size="52" font-weight="700" text-anchor="middle">本地图片缺失</text>
+  <text x="640" y="500" fill="#c9cbd1" font-family="system-ui, sans-serif" font-size="30" text-anchor="middle">离线模式已阻止在线图床加载</text>
+</svg>

@@ -13,7 +13,7 @@ import sanitize from 'sanitize-filename';
 export const info = {
     id: 'frontend-media-localizer',
     name: 'Frontend Card Media Localizer',
-    version: '1.2.0',
+    version: '1.5.0',
     description: 'Downloads and serves frontend-card image, audio, and video resources from the SillyTavern data directory.',
 };
 
@@ -21,20 +21,49 @@ const MANIFEST_VERSION = 1;
 const MAX_REDIRECTS = 5;
 const MAX_RESOURCE_BYTES = 2 * 1024 * 1024 * 1024;
 const PROBE_TIMEOUT_MS = 5000;
-const REMOTE_REQUEST_INTERVAL_MS = 1000;
+const DEFAULT_REMOTE_REQUEST_INTERVAL_MS = 1000;
+const MIN_REMOTE_REQUEST_INTERVAL_MS = 100;
+const MAX_REMOTE_REQUEST_INTERVAL_MS = 60 * 60 * 1000;
 const SUPPORTED_TYPES = new Set(['image', 'audio', 'video']);
 const SAFE_ID = /^[a-f0-9]{64}$/;
 
-let nextRemoteRequestAt = 0;
+const remoteRequestSchedules = new Map();
 let remoteRequestGate = Promise.resolve();
 
-async function waitForRemoteRequestSlot() {
+function clampInterval(value, fallback = DEFAULT_REMOTE_REQUEST_INTERVAL_MS) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.min(MAX_REMOTE_REQUEST_INTERVAL_MS, Math.max(MIN_REMOTE_REQUEST_INTERVAL_MS, Math.round(parsed))) : fallback;
+}
+
+function normalizeRatePolicy(value) {
+    const rules = [];
+    const seen = new Set();
+    for (const item of Array.isArray(value?.rules) ? value.rules.slice(0, 100) : []) {
+        const domain = String(item?.domain ?? '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+        if (!domain || seen.has(domain) || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(domain)) continue;
+        seen.add(domain);
+        rules.push({ domain, intervalMs: clampInterval(item?.intervalMs) });
+    }
+    rules.sort((left, right) => right.domain.length - left.domain.length);
+    return { defaultIntervalMs: clampInterval(value?.defaultIntervalMs), rules };
+}
+
+function rateLimitForUrl(url, policy) {
+    const hostname = new URL(url).hostname.toLowerCase();
+    const rule = policy.rules.find(item => hostname === item.domain || hostname.endsWith(`.${item.domain}`));
+    return { key: rule?.domain || hostname, intervalMs: rule?.intervalMs ?? policy.defaultIntervalMs };
+}
+
+async function waitForRemoteRequestSlot(url, policy) {
+    const { key, intervalMs } = rateLimitForUrl(url, policy);
+    const schedule = remoteRequestSchedules.get(key) ?? { lastStartedAt: 0 };
     const turn = remoteRequestGate.then(async () => {
-        const delay = Math.max(0, nextRemoteRequestAt - Date.now());
+        const delay = Math.max(0, schedule.lastStartedAt + intervalMs - Date.now());
         if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
-        nextRemoteRequestAt = Date.now() + REMOTE_REQUEST_INTERVAL_MS;
+        schedule.lastStartedAt = Date.now();
     });
     remoteRequestGate = turn.catch(() => {});
+    remoteRequestSchedules.set(key, schedule);
     await turn;
 }
 
@@ -146,11 +175,11 @@ async function assertSafeRemoteUrl(value) {
     return parsed;
 }
 
-async function fetchRemote(url, options = {}, timeoutMs = 15000) {
+async function fetchRemote(url, options = {}, timeoutMs = 15000, ratePolicy = normalizeRatePolicy()) {
     let current = String(url);
     for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
         await assertSafeRemoteUrl(current);
-        await waitForRemoteRequestSlot();
+        await waitForRemoteRequestSlot(current, ratePolicy);
         const response = await fetch(current, {
             ...options,
             redirect: 'manual',
@@ -223,18 +252,18 @@ function getReportedSize(response) {
     return range ? Number(range[1]) : null;
 }
 
-async function probeOne(item) {
+async function probeOne(item, ratePolicy) {
     const url = String(item?.url ?? '');
     const result = { url, id: resourceId(url), type: typeFromUrl(url) ?? item?.hint ?? null, size: null, contentType: null, error: null };
     try {
         parseRemoteUrl(url);
-        let request = await fetchRemote(url, { method: 'HEAD' }, PROBE_TIMEOUT_MS);
+        let request = await fetchRemote(url, { method: 'HEAD' }, PROBE_TIMEOUT_MS, ratePolicy);
         result.contentType = normalizeMime(request.response.headers.get('content-type')) || null;
         result.type = typeFromMime(result.contentType) ?? result.type;
         result.size = getReportedSize(request.response);
         await request.response.body?.cancel();
         if (!request.response.ok || result.size === null || !result.type) {
-            request = await fetchRemote(url, { method: 'GET', headers: { Range: 'bytes=0-0' } }, PROBE_TIMEOUT_MS);
+            request = await fetchRemote(url, { method: 'GET', headers: { Range: 'bytes=0-0' } }, PROBE_TIMEOUT_MS, ratePolicy);
             result.contentType = normalizeMime(request.response.headers.get('content-type')) || result.contentType;
             result.type = typeFromMime(result.contentType) ?? result.type;
             result.size = getReportedSize(request.response) ?? result.size;
@@ -263,16 +292,19 @@ async function mapLimit(items, limit, worker) {
     return results;
 }
 
-async function downloadOne(card, item, manifest) {
+async function downloadOne(card, item, manifest, ratePolicy) {
     const url = String(item?.url ?? '');
     const id = resourceId(url);
     const existing = manifest.resources[id];
     if (existing?.relativePath) {
         const existingPath = path.join(cardDirectory(card), existing.relativePath);
-        if (fs.existsSync(existingPath)) return { ...existing, id, skipped: true };
+        try {
+            const stat = fs.statSync(existingPath);
+            if (stat.isFile() && stat.size > 0) return { ...existing, id, size: stat.size, skipped: true };
+        } catch { /* missing or invalid files are downloaded again */ }
     }
 
-    const { response, finalUrl } = await fetchRemote(url, { method: 'GET' }, 10 * 60 * 1000);
+    const { response, finalUrl } = await fetchRemote(url, { method: 'GET' }, 10 * 60 * 1000, ratePolicy);
     if (!response.ok || !response.body) {
         await response.body?.cancel();
         throw new Error(`HTTP ${response.status}`);
@@ -309,6 +341,8 @@ async function downloadOne(card, item, manifest) {
     });
     try {
         await pipeline(Readable.fromWeb(response.body), counter, fs.createWriteStream(temporaryPath, { flags: 'wx' }));
+        if (bytes <= 0) throw new Error('Downloaded resource is empty.');
+        await fs.promises.rm(targetPath, { force: true });
         await fs.promises.rename(temporaryPath, targetPath);
     } catch (error) {
         await fs.promises.rm(temporaryPath, { force: true }).catch(() => {});
@@ -378,16 +412,18 @@ export async function init(router) {
 
     router.post('/probe', async (request, response) => {
         const resources = Array.isArray(request.body?.resources) ? request.body.resources.slice(0, 500) : [];
-        response.json({ resources: await mapLimit(resources, 1, probeOne) });
+        const ratePolicy = normalizeRatePolicy(request.body?.ratePolicy);
+        response.json({ resources: await mapLimit(resources, 1, item => probeOne(item, ratePolicy)) });
     });
 
     router.post('/download', async (request, response) => {
         const card = safeCardName(request.body?.card);
         const resources = Array.isArray(request.body?.resources) ? request.body.resources.slice(0, 12) : [];
+        const ratePolicy = normalizeRatePolicy(request.body?.ratePolicy);
         const manifest = await readManifest(card);
         const results = await mapLimit(resources, 1, async item => {
             try {
-                const record = await downloadOne(card, item, manifest);
+                const record = await downloadOne(card, item, manifest, ratePolicy);
                 return { ok: true, resource: publicRecord(card, record) };
             } catch (error) {
                 return { ok: false, url: String(item?.url ?? ''), error: String(error.message ?? error) };
@@ -397,16 +433,74 @@ export async function init(router) {
         response.json({ card, results });
     });
 
+    router.post('/register-local', async (request, response) => {
+        try {
+            const card = safeCardName(request.body?.card);
+            const source = parseRemoteUrl(request.body?.source).href;
+            const type = String(request.body?.type ?? '');
+            if (!SUPPORTED_TYPES.has(type)) throw new Error('Unsupported media type.');
+            const filename = sanitize(String(request.body?.filename ?? '').trim(), { replacement: '_' }).replace(/[. ]+$/g, '').slice(0, 180);
+            if (!filename || filename === '.' || filename === '..') throw new Error('Invalid filename.');
+            const relativePath = path.posix.join(type, filename);
+            const parent = path.resolve(cardDirectory(card));
+            const target = path.resolve(cardDirectory(card), type, filename);
+            if (!target.startsWith(`${parent}${path.sep}`)) throw new Error('Invalid local resource path.');
+            const stat = await fs.promises.stat(target);
+            if (!stat.isFile() || stat.size <= 0) throw new Error('The selected local resource file does not exist or is empty.');
+            if (stat.size > MAX_RESOURCE_BYTES) throw new Error('Resource exceeds the 2 GiB per-file limit.');
+            const contentType = normalizeMime(request.body?.contentType) || normalizeMime(mime.lookup(filename)) || 'application/octet-stream';
+            const detectedType = typeFromMime(contentType) ?? typeFromUrl(`https://local.invalid/${encodeURIComponent(filename)}`);
+            if (detectedType && detectedType !== type) throw new Error('Local file type does not match the requested media type.');
+            const id = resourceId(source);
+            const manifest = await readManifest(card);
+            const record = {
+                id,
+                source,
+                finalUrl: source,
+                type,
+                contentType,
+                size: stat.size,
+                relativePath,
+                filename,
+                downloadedAt: new Date().toISOString(),
+                status: 'downloaded',
+                importedBy: 'browser-directory-handle',
+            };
+            manifest.resources[id] = record;
+            await writeManifest(card, manifest);
+            response.json({ ok: true, card, resource: publicRecord(card, record) });
+        } catch (error) {
+            const status = error?.code === 'ENOENT' ? 404 : 400;
+            response.status(status).json({ ok: false, error: String(error.message ?? error) });
+        }
+    });
+
     router.get('/library', async (request, response) => {
         const card = safeCardName(request.query?.card);
         const manifest = await readManifest(card);
         const records = [];
+        let repaired = 0;
         for (const record of Object.values(manifest.resources)) {
-            const localPath = record.relativePath ? path.join(cardDirectory(card), record.relativePath) : null;
-            const exists = Boolean(localPath && fs.existsSync(localPath));
+            const parent = path.resolve(cardDirectory(card));
+            const localPath = record.relativePath ? path.resolve(cardDirectory(card), record.relativePath) : null;
+            let exists = false;
+            if (localPath?.startsWith(`${parent}${path.sep}`)) {
+                try {
+                    const stat = fs.statSync(localPath);
+                    exists = stat.isFile() && stat.size > 0;
+                    if (exists && Number(record.size) !== stat.size) record.size = stat.size;
+                } catch { exists = false; }
+            }
+            if (!exists && record.relativePath) {
+                record.relativePath = null;
+                record.status = 'online';
+                record.missingDetectedAt = new Date().toISOString();
+                repaired++;
+            }
             records.push(publicRecord(card, { ...record, exists, status: exists ? 'downloaded' : 'online' }));
         }
-        response.json({ card, root: displayRoot(), resources: records });
+        if (repaired > 0) await writeManifest(card, manifest);
+        response.json({ card, root: displayRoot(), repaired, resources: records });
     });
 
     router.get('/cards', async (_request, response) => {
@@ -479,13 +573,21 @@ export async function init(router) {
     router.get('/file/:card/:id', async (request, response) => {
         const card = safeCardName(request.params.card);
         const id = String(request.params.id);
+        const strictOffline = String(request.query?.offline || '') === '1';
         if (!SAFE_ID.test(id)) return response.sendStatus(400);
         const manifest = await readManifest(card);
         const record = manifest.resources[id];
         if (record?.relativePath) {
             const target = path.resolve(cardDirectory(card), record.relativePath);
             const parent = path.resolve(cardDirectory(card));
-            if (target.startsWith(`${parent}${path.sep}`) && fs.existsSync(target)) {
+            let validFile = false;
+            if (target.startsWith(`${parent}${path.sep}`)) {
+                try {
+                    const stat = fs.statSync(target);
+                    validFile = stat.isFile() && stat.size > 0;
+                } catch { validFile = false; }
+            }
+            if (validFile) {
                 response.setHeader('X-Content-Type-Options', 'nosniff');
                 response.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
                 if (normalizeMime(record.contentType) === 'image/svg+xml') {
@@ -493,6 +595,14 @@ export async function init(router) {
                 }
                 return response.sendFile(target);
             }
+            record.relativePath = null;
+            record.status = 'online';
+            record.missingDetectedAt = new Date().toISOString();
+            await writeManifest(card, manifest);
+        }
+        if (strictOffline) {
+            response.setHeader('Cache-Control', 'no-store');
+            return response.sendStatus(404);
         }
         let source = record?.source;
         if (!source && request.query?.source) {
