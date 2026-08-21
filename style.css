@@ -535,7 +535,7 @@
 
 .fml-resource-row {
     display: grid;
-    grid-template-columns: 24px 28px minmax(0, 1fr) minmax(92px, auto);
+    grid-template-columns: 24px 28px minmax(0, 1fr) minmax(92px, auto) auto;
     align-items: center;
     gap: 7px;
     padding: 8px 4px;
@@ -571,6 +571,14 @@
 }
 
 .fml-resource-status.is-error { color: #e16b6b; }
+
+.fml-resource-download {
+    min-width: 76px;
+    width: auto;
+    padding: 6px 9px;
+    white-space: nowrap;
+    writing-mode: horizontal-tb !important;
+}
 
 .fml-empty-state {
     padding: 48px 20px;
@@ -744,8 +752,9 @@
     .fml-scan-summary,
     .fml-library-summary { align-items: flex-start; flex-direction: column; gap: 4px; }
     .fml-type-selectors { flex: 0 0 auto; padding: 8px 10px; }
-    .fml-resource-row { grid-template-columns: 22px 24px minmax(0, 1fr); }
+    .fml-resource-row { grid-template-columns: 22px 24px minmax(0, 1fr) auto; }
     .fml-resource-status { grid-column: 3; max-width: none; text-align: left; }
+    .fml-resource-download { grid-column: 4; grid-row: 1 / span 2; min-width: 72px; min-height: 44px; }
     .fml-modal-footer {
         flex: 0 0 auto;
         flex-wrap: wrap;

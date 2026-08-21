@@ -14,7 +14,7 @@ import sanitize from 'sanitize-filename';
 export const info = {
     id: 'frontend-media-localizer',
     name: 'Frontend Card Media Localizer',
-    version: '1.6.0',
+    version: '1.6.1',
     description: 'Downloads and serves frontend-card image, audio, and video resources from the SillyTavern data directory.',
 };
 
